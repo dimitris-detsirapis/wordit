@@ -10,11 +10,13 @@ import glob
 import itertools
 import json
 import os
+import random
 import re
 import shlex
 import string
 import sys
 import textwrap
+import time
 import unicodedata
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
@@ -42,6 +44,7 @@ DEFAULT_SYMBOLS = ("!", "@", "#", "$", "_")
 DEFAULT_SEPARATORS = ("", "_", "-", ".")
 DEFAULT_NUMBERS = tuple(str(item) for item in range(10)) + ("12", "23", "69", "123", "1234", "007")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_.-]{0,63}")
+UNICODE_WORD_RE = re.compile(r"\w[\w'_.-]{0,63}", re.UNICODE)
 DATE_SPLIT_RE = re.compile(r"[-_./\\\s]+")
 URLISH_RE = re.compile(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$")
 GITHUB_RESERVED_PATHS = {
@@ -233,6 +236,7 @@ class BuildOptions:
     min_len: int = DEFAULT_MIN_LEN
     max_len: int = DEFAULT_MAX_LEN
     max_candidates: int = DEFAULT_MAX_CANDIDATES
+    preserve_unicode: bool = False
     case_modes: tuple[str, ...] = ("raw", "lower", "title")
     separators: tuple[str, ...] = DEFAULT_SEPARATORS
     years: tuple[str, ...] = ()
@@ -248,8 +252,9 @@ class BuildOptions:
 class WordBank:
     """Ordered, deduplicated word storage with light source tracking."""
 
-    def __init__(self) -> None:
+    def __init__(self, preserve_unicode: bool = False) -> None:
         self._words: OrderedDict[str, str] = OrderedDict()
+        self.preserve_unicode = preserve_unicode
 
     def __len__(self) -> int:
         return len(self._words)
@@ -266,8 +271,9 @@ class WordBank:
     def clear(self) -> None:
         self._words.clear()
 
-    def add(self, word: str, source: str = "manual") -> bool:
-        candidate = clean_candidate(word)
+    def add(self, word: str, source: str = "manual", preserve_unicode: bool | None = None) -> bool:
+        keep_unicode = self.preserve_unicode if preserve_unicode is None else preserve_unicode
+        candidate = clean_candidate(word, preserve_unicode=keep_unicode)
         if not candidate:
             return False
         if candidate in self._words:
@@ -275,10 +281,15 @@ class WordBank:
         self._words[candidate] = source
         return True
 
-    def add_many(self, words: Iterable[str], source: str = "generated") -> int:
+    def add_many(
+        self,
+        words: Iterable[str],
+        source: str = "generated",
+        preserve_unicode: bool | None = None,
+    ) -> int:
         added = 0
         for word in words:
-            if self.add(word, source=source):
+            if self.add(word, source=source, preserve_unicode=preserve_unicode):
                 added += 1
         return added
 
@@ -367,21 +378,17 @@ def ascii_fold(value: str) -> str:
     return normalized.encode("ascii", "ignore").decode("ascii")
 
 
-def clean_candidate(value: str) -> str:
-    value = ascii_fold(str(value)).strip()
+def clean_candidate(value: str, preserve_unicode: bool = False) -> str:
+    value = str(value)
+    value = unicodedata.normalize("NFKC", value) if preserve_unicode else ascii_fold(value)
+    value = value.strip()
     value = re.sub(r"\s+", "", value)
     value = value.strip("\x00\r\n\t")
     return value
 
 
 def ordered_unique(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            out.append(value)
-    return out
+    return list(dict.fromkeys(values))
 
 
 def path_completions(text: str, include_files: bool = True, include_dirs: bool = True) -> list[str]:
@@ -559,6 +566,7 @@ def crawl_url_text(
     max_depth: int = 1,
     same_host_only: bool = True,
     timeout: int = 10,
+    delay_range: tuple[float, float] = (0.5, 1.5),
 ) -> tuple[str, list[str], list[str]]:
     start_url = normalize_harvest_target(start_url)
     parsed_start = urlparse(start_url)
@@ -567,11 +575,16 @@ def crawl_url_text(
     fetched: list[str] = []
     errors: list[str] = []
     text_parts: list[str] = []
+    attempted = 0
+    min_delay, max_delay = delay_range
     while queue and len(fetched) < max_pages:
         url, depth = queue.pop(0)
         if url in visited:
             continue
         visited.add(url)
+        if attempted and max_delay > 0:
+            time.sleep(random.uniform(max(0.0, min_delay), max(min_delay, max_delay)))
+        attempted += 1
         try:
             github_text = harvest_github_profile(url, timeout=timeout)
             if github_text is not None:
@@ -604,7 +617,7 @@ def crawl_url_text(
     return " ".join(text_parts), fetched, errors
 
 
-def parse_ai_keywords(payload: str) -> list[str]:
+def parse_ai_keywords(payload: str, preserve_unicode: bool = False) -> list[str]:
     payload = payload.strip()
     if not payload:
         return []
@@ -618,7 +631,7 @@ def parse_ai_keywords(payload: str) -> list[str]:
             return ordered_unique(str(item) for item in values if str(item).strip())
     except json.JSONDecodeError:
         pass
-    return extract_words(payload, min_len=2, max_len=32, lowercase=False)
+    return extract_words(payload, min_len=2, max_len=32, lowercase=False, preserve_unicode=preserve_unicode)
 
 
 def extract_openai_response_text(data: dict[str, object]) -> str:
@@ -657,7 +670,13 @@ def ai_keyword_prompt(text: str, max_keywords: int) -> str:
     ).strip()
 
 
-def ai_extract_keywords(provider: str, text: str, max_keywords: int = 80, model: str = "") -> list[str]:
+def ai_extract_keywords(
+    provider: str,
+    text: str,
+    max_keywords: int = 80,
+    model: str = "",
+    preserve_unicode: bool = False,
+) -> list[str]:
     provider = provider.strip().lower()
     prompt = ai_keyword_prompt(text, max_keywords)
     if provider == "openai":
@@ -687,7 +706,7 @@ def ai_extract_keywords(provider: str, text: str, max_keywords: int = 80, model:
             raise ValueError(f"OpenAI API error HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise ValueError(f"OpenAI API connection failed: {exc.reason}") from exc
-        return parse_ai_keywords(extract_openai_response_text(data))
+        return parse_ai_keywords(extract_openai_response_text(data), preserve_unicode=preserve_unicode)
 
     if provider == "gemini":
         api_key = os.environ.get("GEMINI_API_KEY")
@@ -732,7 +751,7 @@ def ai_extract_keywords(provider: str, text: str, max_keywords: int = 80, model:
                 for part in content.get("parts", []):
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         parts.append(part["text"])
-        return parse_ai_keywords("\n".join(parts))
+        return parse_ai_keywords("\n".join(parts), preserve_unicode=preserve_unicode)
 
     raise ValueError("Choose provider openai or gemini.")
 
@@ -753,10 +772,16 @@ def extract_words(
     max_len: int = 32,
     lowercase: bool = True,
     include_numbers: bool = True,
+    preserve_unicode: bool = False,
 ) -> list[str]:
-    text = ascii_fold(text)
+    if preserve_unicode:
+        text = unicodedata.normalize("NFKC", text)
+        word_re = UNICODE_WORD_RE
+    else:
+        text = ascii_fold(text)
+        word_re = WORD_RE
     words: list[str] = []
-    for match in WORD_RE.finditer(text):
+    for match in word_re.finditer(text):
         token = match.group(0).strip("'_.-")
         if not token:
             continue
@@ -819,7 +844,7 @@ def bounded_unique_candidates(
     seen: set[str] = set()
     candidates: list[str] = []
     for raw in stream:
-        candidate = clean_candidate(raw)
+        candidate = clean_candidate(raw, preserve_unicode=options.preserve_unicode)
         if not candidate or candidate in seen:
             continue
         if not in_length_bounds(candidate, options):
@@ -880,7 +905,7 @@ def with_leet(stream: Iterable[str], depth: int) -> Iterator[str]:
         yield from leet_variants(candidate, depth=depth, limit=24)
 
 
-def profile_tokens(profile: dict[str, str]) -> tuple[list[str], list[str]]:
+def profile_tokens(profile: dict[str, str], preserve_unicode: bool = False) -> tuple[list[str], list[str]]:
     token_values: list[str] = []
     date_values: list[str] = []
     for key, raw_value in profile.items():
@@ -889,7 +914,13 @@ def profile_tokens(profile: dict[str, str]) -> tuple[list[str], list[str]]:
             date_values.extend(items)
             continue
         for item in items:
-            extracted = extract_words(item, min_len=1, max_len=32, lowercase=True)
+            extracted = extract_words(
+                item,
+                min_len=1,
+                max_len=32,
+                lowercase=True,
+                preserve_unicode=preserve_unicode,
+            )
             if len(extracted) > 1:
                 token_values.append("".join(extracted))
             token_values.extend(extracted)
@@ -906,7 +937,7 @@ def pair_joiners(options: BuildOptions) -> tuple[str, ...]:
 
 
 def build_profile_wordlist(profile: dict[str, str], options: BuildOptions) -> list[str]:
-    tokens, dates = profile_tokens(profile)
+    tokens, dates = profile_tokens(profile, preserve_unicode=options.preserve_unicode)
     numeric_tokens = [token for token in tokens if token.isdigit()]
     base_tokens = [token for token in tokens if not token.isdigit()]
     if not base_tokens:
@@ -955,7 +986,11 @@ def build_profile_wordlist(profile: dict[str, str], options: BuildOptions) -> li
 
 
 def mutate_wordlist(words: Sequence[str], options: BuildOptions) -> list[str]:
-    source = ordered_unique(clean_candidate(word) for word in words if clean_candidate(word))
+    source = ordered_unique(
+        candidate
+        for word in words
+        if (candidate := clean_candidate(word, preserve_unicode=options.preserve_unicode))
+    )
     numeric_source = [word for word in source if word.isdigit()]
     word_source = [word for word in source if not word.isdigit()]
     if word_source:
@@ -1111,11 +1146,11 @@ def option_preset(name: str, max_candidates: int | None = None) -> BuildOptions:
     )
 
 
-def read_word_file(path: str | Path, token_mode: bool = False) -> list[str]:
+def read_word_file(path: str | Path, token_mode: bool = False, preserve_unicode: bool = False) -> list[str]:
     file_path = Path(path).expanduser()
     text = file_path.read_text(encoding="utf-8", errors="ignore")
     if token_mode:
-        return extract_words(text, min_len=1, max_len=64, lowercase=False)
+        return extract_words(text, min_len=1, max_len=64, lowercase=False, preserve_unicode=preserve_unicode)
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
@@ -1223,10 +1258,11 @@ def generate_huge_masks(
     known_digits: str = "",
     known_suffix: str = "",
     limit: int = 500,
+    preserve_unicode: bool = False,
 ) -> list[str]:
     bases: list[str] = []
     for word in words:
-        cleaned = clean_candidate(word)
+        cleaned = clean_candidate(word, preserve_unicode=preserve_unicode)
         if not cleaned:
             continue
         bases.extend(case_variants(cleaned, case_modes))
@@ -1283,9 +1319,9 @@ def banner() -> str:
 class WorditShell(cmd.Cmd):
     intro = None
 
-    def __init__(self) -> None:
+    def __init__(self, preserve_unicode: bool = False) -> None:
         super().__init__()
-        self.bank = WordBank()
+        self.bank = WordBank(preserve_unicode=preserve_unicode)
         self.default_min_len = DEFAULT_MIN_LEN
         self.default_max_len = DEFAULT_MAX_LEN
         self.default_max_candidates = DEFAULT_MAX_CANDIDATES
@@ -1541,10 +1577,13 @@ class WorditShell(cmd.Cmd):
 
     def simple_options_from_prompt(self, style: str) -> BuildOptions:
         size = self.ask_choice("Wordlist size", ("small", "medium", "large"), "medium")
-        return option_preset(style, WORDLIST_SIZE_CAPS[size])
+        return replace(option_preset(style, WORDLIST_SIZE_CAPS[size]), preserve_unicode=self.bank.preserve_unicode)
 
     def options_from_prompt(self, preset: str) -> BuildOptions:
-        options = option_preset(preset, self.default_max_candidates)
+        options = replace(
+            option_preset(preset, self.default_max_candidates),
+            preserve_unicode=self.bank.preserve_unicode,
+        )
         min_len = self.ask_int("Minimum length", options.min_len, minimum=1)
         max_len = self.ask_int("Maximum length", options.max_len, minimum=min_len)
         max_candidates = self.ask_int(
@@ -1594,6 +1633,10 @@ class WorditShell(cmd.Cmd):
             "places": self.ask("Places, projects, products"),
             "extras": self.ask("Extra hints"),
         }
+        self.bank.preserve_unicode = self.ask_bool(
+            "Preserve non-ASCII characters",
+            self.bank.preserve_unicode,
+        )
         style = self.ask_mutation_style("focused")
         options = self.simple_options_from_prompt(style)
         candidates = build_profile_wordlist(profile, options)
@@ -1605,7 +1648,13 @@ class WorditShell(cmd.Cmd):
         items = parse_human_list(raw)
         expanded: list[str] = []
         for item in items:
-            tokens = extract_words(item, min_len=1, max_len=64, lowercase=False)
+            tokens = extract_words(
+                item,
+                min_len=1,
+                max_len=64,
+                lowercase=False,
+                preserve_unicode=self.bank.preserve_unicode,
+            )
             if len(tokens) > 1:
                 expanded.append("".join(tokens))
             expanded.extend(tokens or [item])
@@ -1619,7 +1668,11 @@ class WorditShell(cmd.Cmd):
             return
         token_mode = self.ask_bool("Extract tokens instead of one word per line", False)
         try:
-            words = read_word_file(path, token_mode=token_mode)
+            words = read_word_file(
+                path,
+                token_mode=token_mode,
+                preserve_unicode=self.bank.preserve_unicode,
+            )
         except IsADirectoryError:
             print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
             return
@@ -1640,6 +1693,8 @@ class WorditShell(cmd.Cmd):
             return
         min_len = self.ask_int("Minimum harvested word length", 3, minimum=1)
         max_len = self.ask_int("Maximum harvested word length", 32, minimum=min_len)
+        preserve_unicode = self.ask_bool("Preserve non-ASCII harvested words", self.bank.preserve_unicode)
+        self.bank.preserve_unicode = preserve_unicode
         try:
             if target_is_url:
                 if not self.ask_bool("Confirm this URL is in scope for you", False):
@@ -1656,14 +1711,20 @@ class WorditShell(cmd.Cmd):
         except (OSError, ValueError) as exc:
             print(f"Harvest failed: {exc}")
             return
-        words = extract_words(text, min_len=min_len, max_len=max_len, lowercase=True)
+        words = extract_words(
+            text,
+            min_len=min_len,
+            max_len=max_len,
+            lowercase=True,
+            preserve_unicode=preserve_unicode,
+        )
         if not words:
             if target_is_url:
                 print("No words were found. Check that the URL exists, is public, and is not rendered only by JavaScript.")
             else:
                 print("No words were found in that file with the selected length limits.")
             return
-        added = self.bank.add_many(words, source=source)
+        added = self.bank.add_many(words, source=source, preserve_unicode=preserve_unicode)
         if added == 0:
             print("No new candidates added; the harvested words were already in this session.")
             return
@@ -1682,6 +1743,8 @@ class WorditShell(cmd.Cmd):
         max_pages = min(self.ask_int("Maximum pages to fetch", 3, minimum=1), 10)
         max_depth = min(self.ask_int("Link depth", 1, minimum=0), 3)
         same_host = self.ask_bool("Stay on the same host", True)
+        preserve_unicode = self.ask_bool("Preserve non-ASCII harvested words", self.bank.preserve_unicode)
+        self.bank.preserve_unicode = preserve_unicode
         provider = self.ask("AI provider openai/gemini/off", "off").strip().lower()
         if provider in {"none", "no", "n"}:
             provider = "off"
@@ -1701,11 +1764,23 @@ class WorditShell(cmd.Cmd):
             print("Fetch notes:")
             for error in errors[:5]:
                 print(f"  {error}")
-        normal_words = extract_words(text, min_len=2, max_len=32, lowercase=True)
+        normal_words = extract_words(
+            text,
+            min_len=2,
+            max_len=32,
+            lowercase=True,
+            preserve_unicode=preserve_unicode,
+        )
         ai_words: list[str] = []
         if provider != "off":
             try:
-                ai_words = ai_extract_keywords(provider, text, max_keywords=100, model=model)
+                ai_words = ai_extract_keywords(
+                    provider,
+                    text,
+                    max_keywords=100,
+                    model=model,
+                    preserve_unicode=preserve_unicode,
+                )
             except ValueError as exc:
                 print(f"AI enrichment skipped: {exc}")
                 if provider == "openai":
@@ -1716,7 +1791,7 @@ class WorditShell(cmd.Cmd):
         if not combined:
             print("No words were found. Check that the URL is public and reachable.")
             return
-        added = self.bank.add_many(combined, source=f"aiharvest:{provider}")
+        added = self.bank.add_many(combined, source=f"aiharvest:{provider}", preserve_unicode=preserve_unicode)
         if added == 0:
             print("No new candidates added; the harvested words were already in this session.")
             return
@@ -1806,7 +1881,16 @@ class WorditShell(cmd.Cmd):
         if raw_bases:
             bases: list[str] = []
             for item in parse_human_list(raw_bases):
-                bases.extend(extract_words(item, min_len=1, max_len=64, lowercase=False) or [item])
+                bases.extend(
+                    extract_words(
+                        item,
+                        min_len=1,
+                        max_len=64,
+                        lowercase=False,
+                        preserve_unicode=self.bank.preserve_unicode,
+                    )
+                    or [item]
+                )
         else:
             bases = self.bank.words()
         bases = ordered_unique(bases)
@@ -1839,6 +1923,7 @@ class WorditShell(cmd.Cmd):
             case_modes=case_modes,
             known_digits=known_digits,
             known_suffix=known_suffix,
+            preserve_unicode=self.bank.preserve_unicode,
         )
         try:
             Path(path).expanduser().write_text("\n".join(masks) + "\n", encoding="utf-8")
@@ -2019,29 +2104,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-len", type=int, default=DEFAULT_MIN_LEN)
     parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES)
+    parser.add_argument(
+        "--preserve-unicode",
+        action="store_true",
+        help="Keep non-ASCII letters when extracting and storing words.",
+    )
     parser.add_argument("--i-understand", action="store_true", help="Confirm URL harvesting is authorized.")
     return parser
 
 
 def run_noninteractive(args: argparse.Namespace) -> int:
-    bank = WordBank()
+    bank = WordBank(preserve_unicode=args.preserve_unicode)
     options = replace(
         option_preset(args.mutate or "focused", args.max_candidates),
         min_len=args.min_len,
         max_len=args.max_len,
         max_candidates=args.max_candidates,
+        preserve_unicode=args.preserve_unicode,
     )
 
     for raw in args.add:
         words: list[str] = []
         for item in parse_human_list(raw):
-            words.extend(extract_words(item, min_len=1, max_len=64, lowercase=False) or [item])
+            words.extend(
+                extract_words(
+                    item,
+                    min_len=1,
+                    max_len=64,
+                    lowercase=False,
+                    preserve_unicode=args.preserve_unicode,
+                )
+                or [item]
+            )
         bank.add_many(words, source="manual")
     for path in args.import_file:
-        bank.add_many(read_word_file(path), source=f"import:{Path(path).name}")
+        bank.add_many(
+            read_word_file(path, preserve_unicode=args.preserve_unicode),
+            source=f"import:{Path(path).name}",
+        )
     for path in args.harvest_file:
         text = Path(path).expanduser().read_text(encoding="utf-8", errors="ignore")
-        bank.add_many(extract_words(text, min_len=args.min_len, max_len=args.max_len), source="harvest:file")
+        bank.add_many(
+            extract_words(
+                text,
+                min_len=args.min_len,
+                max_len=args.max_len,
+                preserve_unicode=args.preserve_unicode,
+            ),
+            source="harvest:file",
+        )
     for url in args.harvest_url:
         if not args.i_understand:
             raise SystemExit("--harvest-url requires --i-understand to confirm authorization.")
@@ -2049,7 +2160,15 @@ def run_noninteractive(args: argparse.Namespace) -> int:
             harvested = harvest_url(url)
         except ValueError as exc:
             raise SystemExit(f"Harvest failed: {exc}") from exc
-        bank.add_many(extract_words(harvested, min_len=args.min_len, max_len=args.max_len), source="harvest:url")
+        bank.add_many(
+            extract_words(
+                harvested,
+                min_len=args.min_len,
+                max_len=args.max_len,
+                preserve_unicode=args.preserve_unicode,
+            ),
+            source="harvest:url",
+        )
     if args.profile:
         profile = {"extras": args.profile, "dates": args.profile}
         bank.add_many(build_profile_wordlist(profile, options), source="profile")
@@ -2126,7 +2245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if noninteractive:
         return run_noninteractive(args)
     try:
-        WorditShell().cmdloop()
+        WorditShell(preserve_unicode=args.preserve_unicode).cmdloop()
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130
