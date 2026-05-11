@@ -19,7 +19,7 @@ assess.
 - Focused mutation styles: numbers, symbols, capitals, mixed, quick, and wide.
 - URL and file harvesting with GitHub profile support.
 - Optional bounded recursive harvest with AI keyword enrichment.
-- Huge-pattern `.hcmask` export for shapes like `Kista` + 9 digits + 2 symbols.
+- Huge-pattern `.hcmask` export for shapes like `Tester` + 9 digits + 2 symbols.
 - Hashcat-style mask generation, `.hcmask` templates, and small rule exports.
 - Scriptable command-line mode for repeatable workflows.
 
