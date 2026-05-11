@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+"""w0rd!t: an interactive wordlist builder for authorized security work."""
+
+from __future__ import annotations
+
+import argparse
+import cmd
+import getpass
+import glob
+import itertools
+import json
+import os
+import re
+import shlex
+import string
+import sys
+import textwrap
+import unicodedata
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, replace
+from datetime import datetime
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Iterable, Iterator, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+
+try:
+    import readline
+except ImportError:  # pragma: no cover - Unix shells normally provide this.
+    readline = None  # type: ignore[assignment]
+
+
+APP_NAME = "w0rd!t"
+VERSION = "1.1.0"
+CREATOR_NAME = "Dimitris Detsirapis"
+DEFAULT_MAX_CANDIDATES = 100_000
+DEFAULT_MIN_LEN = 4
+DEFAULT_MAX_LEN = 32
+DEFAULT_SYMBOLS = ("!", "@", "#", "$", "_")
+DEFAULT_SEPARATORS = ("", "_", "-", ".")
+DEFAULT_NUMBERS = tuple(str(item) for item in range(10)) + ("12", "23", "69", "123", "1234", "007")
+WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_.-]{0,63}")
+DATE_SPLIT_RE = re.compile(r"[-_./\\\s]+")
+URLISH_RE = re.compile(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$")
+GITHUB_RESERVED_PATHS = {
+    "about",
+    "collections",
+    "customer-stories",
+    "enterprise",
+    "events",
+    "explore",
+    "features",
+    "github-copilot",
+    "login",
+    "marketplace",
+    "new",
+    "organizations",
+    "orgs",
+    "pricing",
+    "readme",
+    "search",
+    "settings",
+    "showcases",
+    "sponsors",
+    "topics",
+}
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "magenta": "\033[35m",
+    "red": "\033[31m",
+}
+
+STYLE_ALIASES = {
+    "": "focused",
+    "best": "focused",
+    "default": "focused",
+    "normal": "focused",
+    "smart": "focused",
+    "useful": "focused",
+    "number": "numbers",
+    "digit": "numbers",
+    "digits": "numbers",
+    "special": "symbols",
+    "specials": "symbols",
+    "symbol": "symbols",
+    "symbols": "symbols",
+    "numsym": "both",
+    "mixed": "both",
+    "capital": "caps",
+    "capitalize": "caps",
+    "capitalise": "caps",
+    "case": "caps",
+    "advanced": "wide",
+}
+
+MUTATION_STYLES = ("focused", "numbers", "symbols", "both", "caps", "quick", "wide")
+WORDLIST_SIZE_CAPS = {
+    "small": 25_000,
+    "medium": 100_000,
+    "large": 500_000,
+}
+AI_CONFIG_KEYS = (
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "W0RDIT_OPENAI_MODEL",
+    "W0RDIT_GEMINI_MODEL",
+)
+
+LEET_MAP: dict[str, tuple[str, ...]] = {
+    "a": ("4", "@"),
+    "b": ("8",),
+    "e": ("3",),
+    "g": ("9",),
+    "i": ("1", "!"),
+    "l": ("1",),
+    "o": ("0",),
+    "s": ("5", "$"),
+    "t": ("7",),
+    "z": ("2",),
+}
+
+BUILTIN_MASK_CHARSETS: dict[str, str] = {
+    "l": string.ascii_lowercase,
+    "u": string.ascii_uppercase,
+    "d": string.digits,
+    "h": string.digits + "abcdef",
+    "H": string.digits + "ABCDEF",
+    "s": r"""!"#$%&'()*+,-./:;<=>@[]^_`{|}~""",
+}
+BUILTIN_MASK_CHARSETS["a"] = (
+    BUILTIN_MASK_CHARSETS["l"]
+    + BUILTIN_MASK_CHARSETS["u"]
+    + BUILTIN_MASK_CHARSETS["d"]
+    + BUILTIN_MASK_CHARSETS["s"]
+)
+
+
+def color_enabled() -> bool:
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def color(text: str, *styles: str) -> str:
+    if not color_enabled():
+        return text
+    prefix = "".join(ANSI[style] for style in styles if style in ANSI)
+    return f"{prefix}{text}{ANSI['reset']}" if prefix else text
+
+
+def normalize_style(name: str) -> str:
+    normalized = (name or "focused").strip().lower()
+    return STYLE_ALIASES.get(normalized, normalized)
+
+
+def default_ai_config_path() -> Path:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return Path(os.environ.get("W0RDIT_AI_CONFIG", config_home / "w0rdit" / "ai.env"))
+
+
+def mask_secret(value: str) -> str:
+    if not value:
+        return "not set"
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def ai_provider_label(provider: str) -> str:
+    return "OpenAI" if provider == "openai" else "Gemini"
+
+
+def read_ai_config(path: str | Path | None = None) -> dict[str, str]:
+    config_path = Path(path) if path is not None else default_ai_config_path()
+    if not config_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in config_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in AI_CONFIG_KEYS:
+            continue
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def write_ai_config(values: dict[str, str], path: str | Path | None = None) -> Path:
+    config_path = Path(path) if path is not None else default_ai_config_path()
+    current = read_ai_config(config_path)
+    for key, value in values.items():
+        if key not in AI_CONFIG_KEYS:
+            continue
+        if value:
+            current[key] = value
+        else:
+            current.pop(key, None)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# w0rd!t AI API configuration", "# Keep this file private."]
+    for key in AI_CONFIG_KEYS:
+        if key in current:
+            lines.append(f"{key}={json.dumps(current[key])}")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(config_path, 0o600)
+    return config_path
+
+
+def load_ai_config(path: str | Path | None = None, overwrite: bool = False) -> list[str]:
+    loaded: list[str] = []
+    for key, value in read_ai_config(path).items():
+        if overwrite or not os.environ.get(key):
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
+@dataclass(frozen=True)
+class BuildOptions:
+    min_len: int = DEFAULT_MIN_LEN
+    max_len: int = DEFAULT_MAX_LEN
+    max_candidates: int = DEFAULT_MAX_CANDIDATES
+    case_modes: tuple[str, ...] = ("raw", "lower", "title")
+    separators: tuple[str, ...] = DEFAULT_SEPARATORS
+    years: tuple[str, ...] = ()
+    numbers: tuple[str, ...] = DEFAULT_NUMBERS
+    symbols: tuple[str, ...] = DEFAULT_SYMBOLS
+    leet_depth: int = 1
+    pair_limit: int = 40
+    include_pairs: bool = True
+    include_reverse: bool = True
+    include_sandwich: bool = True
+
+
+class WordBank:
+    """Ordered, deduplicated word storage with light source tracking."""
+
+    def __init__(self) -> None:
+        self._words: OrderedDict[str, str] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._words)
+
+    def __bool__(self) -> bool:
+        return bool(self._words)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._words)
+
+    def words(self) -> list[str]:
+        return list(self._words)
+
+    def clear(self) -> None:
+        self._words.clear()
+
+    def add(self, word: str, source: str = "manual") -> bool:
+        candidate = clean_candidate(word)
+        if not candidate:
+            return False
+        if candidate in self._words:
+            return False
+        self._words[candidate] = source
+        return True
+
+    def add_many(self, words: Iterable[str], source: str = "generated") -> int:
+        added = 0
+        for word in words:
+            if self.add(word, source=source):
+                added += 1
+        return added
+
+    def stats(self) -> dict[str, object]:
+        lengths = [len(word) for word in self._words]
+        sources = Counter(self._words.values())
+        return {
+            "count": len(self._words),
+            "min": min(lengths) if lengths else 0,
+            "max": max(lengths) if lengths else 0,
+            "avg": (sum(lengths) / len(lengths)) if lengths else 0.0,
+            "sources": sources,
+        }
+
+
+class TextExtractor(HTMLParser):
+    """Tiny HTML to text extractor for one-page harvesting."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_name = tag.lower()
+        attr_map = {name.lower(): value for name, value in attrs if value}
+        if tag_name in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+            return
+        if tag_name == "meta":
+            content = attr_map.get("content")
+            if content:
+                self.parts.append(content)
+        for attr_name in ("title", "alt", "aria-label"):
+            value = attr_map.get(attr_name)
+            if value:
+                self.parts.append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript", "svg"} and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return " ".join(self.parts)
+
+
+class LinkExtractor(HTMLParser):
+    """Extract same-page links for bounded, authorized crawling."""
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                url = urljoin(self.base_url, value)
+                parsed = urlparse(url)
+                if parsed.scheme in {"http", "https"}:
+                    normalized = parsed._replace(fragment="").geturl()
+                    self.links.append(normalized)
+
+
+def current_year() -> int:
+    return datetime.now().year
+
+
+def recent_years(depth: int = 5) -> tuple[str, ...]:
+    year = current_year()
+    values: list[str] = []
+    for item in range(year, year - depth, -1):
+        values.append(str(item))
+        values.append(str(item)[2:])
+    return tuple(ordered_unique(values))
+
+
+def ascii_fold(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return normalized.encode("ascii", "ignore").decode("ascii")
+
+
+def clean_candidate(value: str) -> str:
+    value = ascii_fold(str(value)).strip()
+    value = re.sub(r"\s+", "", value)
+    value = value.strip("\x00\r\n\t")
+    return value
+
+
+def ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def path_completions(text: str, include_files: bool = True, include_dirs: bool = True) -> list[str]:
+    """Return readline-friendly path matches, adding a slash for directories."""
+    raw = text or ""
+    if raw.startswith(("http://", "https://")):
+        return []
+    expanded = os.path.expanduser(raw)
+    pattern = expanded + "*" if expanded else "*"
+    home = str(Path.home())
+    matches: list[str] = []
+    for match in sorted(glob.glob(pattern)):
+        is_dir = os.path.isdir(match)
+        if is_dir and not include_dirs:
+            continue
+        if not is_dir and not include_files:
+            continue
+        display = match
+        if raw.startswith("~") and display.startswith(home):
+            display = "~" + display[len(home) :]
+        if is_dir:
+            display += os.sep
+        matches.append(display)
+    return matches
+
+
+def normalize_harvest_target(target: str) -> str:
+    target = target.strip()
+    if not target:
+        return target
+    if target.startswith(("http://", "https://")):
+        return target
+    if URLISH_RE.match(target) and not Path(target).expanduser().exists():
+        return "https://" + target
+    return target
+
+
+def url_hint_text(url: str) -> str:
+    parsed = urlparse(url)
+    pieces: list[str] = []
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    if host:
+        pieces.extend(host.split("."))
+    for segment in parsed.path.split("/"):
+        segment = segment.strip()
+        if not segment:
+            continue
+        pieces.append(segment)
+        split_parts = [part for part in re.split(r"[-_.~]+", segment) if part]
+        pieces.extend(split_parts)
+        if len(split_parts) > 1:
+            pieces.append("".join(split_parts))
+    return " ".join(ordered_unique(pieces))
+
+
+def github_profile_name(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    if host != "github.com":
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 1:
+        return None
+    username = parts[0]
+    if username.lower() in GITHUB_RESERVED_PATHS:
+        return None
+    return username
+
+
+def fetch_url_text(url: str, max_bytes: int = 2_000_000, timeout: int = 10) -> tuple[str, str]:
+    request = Request(
+        url,
+        headers={
+            "Accept": "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
+            "User-Agent": f"{APP_NAME}/{VERSION} authorized-wordlist-builder",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise ValueError(f"Response was larger than {max_bytes:,} bytes.")
+        content_type = response.headers.get("content-type", "")
+    charset = "utf-8"
+    match = re.search(r"charset=([A-Za-z0-9_.-]+)", content_type)
+    if match:
+        charset = match.group(1)
+    return payload.decode(charset, errors="ignore"), content_type
+
+
+def json_to_harvest_text(value: object) -> str:
+    parts: list[str] = []
+    if isinstance(value, dict):
+        for item in value.values():
+            parts.append(json_to_harvest_text(item))
+    elif isinstance(value, list):
+        for item in value:
+            parts.append(json_to_harvest_text(item))
+    elif isinstance(value, (str, int, float)):
+        text = str(value).strip()
+        if text:
+            parts.append(text)
+    return " ".join(part for part in parts if part)
+
+
+def github_profile_to_harvest_text(profile: object) -> str:
+    if not isinstance(profile, dict):
+        return ""
+    fields = ("login", "name", "company", "blog", "location", "bio", "twitter_username")
+    parts = [str(profile[field]) for field in fields if profile.get(field)]
+    return " ".join(parts)
+
+
+def harvest_github_profile(url: str, max_bytes: int = 2_000_000, timeout: int = 10) -> str | None:
+    username = github_profile_name(url)
+    if not username:
+        return None
+    api_base = f"https://api.github.com/users/{username}"
+    request_headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME}/{VERSION} authorized-wordlist-builder",
+    }
+
+    def fetch_json(api_url: str) -> object:
+        request = Request(api_url, headers=request_headers)
+        with urlopen(request, timeout=timeout) as response:
+            payload = response.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                raise ValueError(f"Response was larger than {max_bytes:,} bytes.")
+        return json.loads(payload.decode("utf-8", errors="ignore"))
+
+    try:
+        profile = fetch_json(api_base)
+    except HTTPError:
+        return None
+    except (URLError, json.JSONDecodeError):
+        return None
+
+    parts = [username, url_hint_text(url), github_profile_to_harvest_text(profile)]
+    try:
+        repos = fetch_json(f"{api_base}/repos?per_page=100&sort=updated")
+    except (HTTPError, URLError, json.JSONDecodeError, ValueError):
+        repos = []
+    if isinstance(repos, list):
+        for repo in repos[:100]:
+            if isinstance(repo, dict):
+                for key in ("name", "full_name", "description", "language", "homepage"):
+                    value = repo.get(key)
+                    if value:
+                        parts.append(str(value))
+                topics = repo.get("topics")
+                if isinstance(topics, list):
+                    parts.extend(str(topic) for topic in topics)
+    return " ".join(parts)
+
+
+def extract_page_text_and_links(url: str, max_bytes: int = 2_000_000, timeout: int = 10) -> tuple[str, list[str]]:
+    decoded, content_type = fetch_url_text(url, max_bytes=max_bytes, timeout=timeout)
+    if "html" in content_type.lower() or "<html" in decoded[:500].lower():
+        parser = TextExtractor()
+        parser.feed(decoded)
+        links = LinkExtractor(url)
+        links.feed(decoded)
+        return parser.text() + " " + url_hint_text(url), ordered_unique(links.links)
+    if "json" in content_type.lower():
+        try:
+            return json_to_harvest_text(json.loads(decoded)) + " " + url_hint_text(url), []
+        except json.JSONDecodeError:
+            pass
+    return decoded + " " + url_hint_text(url), []
+
+
+def crawl_url_text(
+    start_url: str,
+    max_pages: int = 3,
+    max_depth: int = 1,
+    same_host_only: bool = True,
+    timeout: int = 10,
+) -> tuple[str, list[str], list[str]]:
+    start_url = normalize_harvest_target(start_url)
+    parsed_start = urlparse(start_url)
+    queue: list[tuple[str, int]] = [(start_url, 0)]
+    visited: set[str] = set()
+    fetched: list[str] = []
+    errors: list[str] = []
+    text_parts: list[str] = []
+    while queue and len(fetched) < max_pages:
+        url, depth = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            github_text = harvest_github_profile(url, timeout=timeout)
+            if github_text is not None:
+                text = github_text
+                links: list[str] = []
+            else:
+                text, links = extract_page_text_and_links(url, timeout=timeout)
+        except HTTPError as exc:
+            hint_text = url_hint_text(url)
+            if hint_text:
+                text_parts.append(hint_text)
+            errors.append(f"{url}: HTTP {exc.code} {exc.reason}")
+            continue
+        except (URLError, ValueError) as exc:
+            hint_text = url_hint_text(url)
+            if hint_text:
+                text_parts.append(hint_text)
+            errors.append(f"{url}: {exc}")
+            continue
+        text_parts.append(text)
+        fetched.append(url)
+        if depth >= max_depth:
+            continue
+        for link in links:
+            parsed_link = urlparse(link)
+            if same_host_only and parsed_link.netloc != parsed_start.netloc:
+                continue
+            if link not in visited and len(queue) + len(fetched) < max_pages * 3:
+                queue.append((link, depth + 1))
+    return " ".join(text_parts), fetched, errors
+
+
+def parse_ai_keywords(payload: str) -> list[str]:
+    payload = payload.strip()
+    if not payload:
+        return []
+    try:
+        decoded = json.loads(payload)
+        if isinstance(decoded, dict):
+            values = decoded.get("keywords", [])
+        else:
+            values = decoded
+        if isinstance(values, list):
+            return ordered_unique(str(item) for item in values if str(item).strip())
+    except json.JSONDecodeError:
+        pass
+    return extract_words(payload, min_len=2, max_len=32, lowercase=False)
+
+
+def extract_openai_response_text(data: dict[str, object]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+    parts: list[str] = []
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                for content_item in content:
+                    if isinstance(content_item, dict):
+                        text = content_item.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+    return "\n".join(parts)
+
+
+def ai_keyword_prompt(text: str, max_keywords: int) -> str:
+    clipped = text[:18_000]
+    return textwrap.dedent(
+        f"""
+        You are helping with authorized password recovery and security training.
+        Extract up to {max_keywords} useful seed words from the public/profile text below.
+        Return only JSON in this exact shape: {{"keywords":["word","two word phrase"]}}.
+        Prefer names, handles, projects, brands, teams, locations, repo names, interests,
+        dates/years, short phrases, and distinctive terms. Do not invent private facts.
+
+        TEXT:
+        {clipped}
+        """
+    ).strip()
+
+
+def ai_extract_keywords(provider: str, text: str, max_keywords: int = 80, model: str = "") -> list[str]:
+    provider = provider.strip().lower()
+    prompt = ai_keyword_prompt(text, max_keywords)
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not set.")
+        selected_model = model or os.environ.get("W0RDIT_OPENAI_MODEL", "gpt-4.1-mini")
+        body = {
+            "model": selected_model,
+            "input": prompt,
+            "instructions": "Return compact JSON only. No markdown.",
+        }
+        request = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            raise ValueError(f"OpenAI API error HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise ValueError(f"OpenAI API connection failed: {exc.reason}") from exc
+        return parse_ai_keywords(extract_openai_response_text(data))
+
+    if provider == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is not set.")
+        selected_model = model or os.environ.get("W0RDIT_GEMINI_MODEL", "gemini-2.5-flash")
+        body = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                    ],
+                }
+            ]
+        }
+        request = Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=45) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            raise ValueError(f"Gemini API error HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise ValueError(f"Gemini API connection failed: {exc.reason}") from exc
+        parts: list[str] = []
+        candidates = data.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                content = candidate.get("content")
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts", []):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+        return parse_ai_keywords("\n".join(parts))
+
+    raise ValueError("Choose provider openai or gemini.")
+
+
+def parse_human_list(value: str) -> list[str]:
+    if not value:
+        return []
+    lexer = shlex.shlex(value, posix=True)
+    lexer.whitespace += ",;"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return [item.strip() for item in lexer if item.strip()]
+
+
+def extract_words(
+    text: str,
+    min_len: int = 3,
+    max_len: int = 32,
+    lowercase: bool = True,
+    include_numbers: bool = True,
+) -> list[str]:
+    text = ascii_fold(text)
+    words: list[str] = []
+    for match in WORD_RE.finditer(text):
+        token = match.group(0).strip("'_.-")
+        if not token:
+            continue
+        if not include_numbers and token.isdigit():
+            continue
+        if len(token) < min_len or len(token) > max_len:
+            continue
+        words.append(token.lower() if lowercase else token)
+    return ordered_unique(words)
+
+
+def parse_date_fragments(values: Iterable[str]) -> list[str]:
+    fragments: list[str] = []
+    for value in values:
+        value = ascii_fold(value).strip()
+        if not value:
+            continue
+        pieces = [piece for piece in DATE_SPLIT_RE.split(value) if piece]
+        if len(pieces) == 3 and all(piece.isdigit() for piece in pieces):
+            a, b, c = pieces
+            year = ""
+            month = ""
+            day = ""
+            if len(a) == 4:
+                year, month, day = a, b, c
+            elif len(c) == 4:
+                month, day, year = a, b, c
+            elif len(c) == 2:
+                month, day, year = a, b, c
+            if year:
+                month = month.zfill(2)
+                day = day.zfill(2)
+                fragments.extend(
+                    [
+                        year,
+                        year[-2:],
+                        month + day,
+                        day + month,
+                        month + day + year,
+                        day + month + year,
+                    ]
+                )
+                continue
+        digits = re.sub(r"\D+", "", value)
+        if digits:
+            fragments.append(digits)
+            if len(digits) == 4:
+                fragments.append(digits[-2:])
+    return ordered_unique(fragments)
+
+
+def in_length_bounds(value: str, options: BuildOptions) -> bool:
+    return options.min_len <= len(value) <= options.max_len
+
+
+def bounded_unique_candidates(
+    stream: Iterable[str],
+    options: BuildOptions,
+) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for raw in stream:
+        candidate = clean_candidate(raw)
+        if not candidate or candidate in seen:
+            continue
+        if not in_length_bounds(candidate, options):
+            continue
+        seen.add(candidate)
+        candidates.append(candidate)
+        if len(candidates) >= options.max_candidates:
+            break
+    return candidates
+
+
+def case_variants(word: str, modes: Sequence[str]) -> list[str]:
+    variants: list[str] = []
+    for mode in modes:
+        if mode == "raw":
+            variants.append(word)
+        elif mode == "lower":
+            variants.append(word.lower())
+        elif mode == "upper":
+            variants.append(word.upper())
+        elif mode == "title":
+            variants.append(word.title())
+        elif mode == "capitalize":
+            variants.append(word.capitalize())
+        elif mode == "swap":
+            variants.append(word.swapcase())
+    return ordered_unique(variants)
+
+
+def leet_variants(word: str, depth: int = 1, limit: int = 64) -> list[str]:
+    if depth <= 0:
+        return []
+    positions = [
+        (index, LEET_MAP[char.lower()])
+        for index, char in enumerate(word)
+        if char.lower() in LEET_MAP
+    ]
+    variants: list[str] = []
+    for width in range(1, min(depth, len(positions)) + 1):
+        for combo in itertools.combinations(positions, width):
+            indexes = [item[0] for item in combo]
+            replacement_sets = [item[1] for item in combo]
+            for replacements in itertools.product(*replacement_sets):
+                chars = list(word)
+                for index, replacement in zip(indexes, replacements):
+                    chars[index] = replacement
+                variant = "".join(chars)
+                if variant != word:
+                    variants.append(variant)
+                if len(variants) >= limit:
+                    return ordered_unique(variants)
+    return ordered_unique(variants)
+
+
+def with_leet(stream: Iterable[str], depth: int) -> Iterator[str]:
+    for candidate in stream:
+        yield candidate
+        yield from leet_variants(candidate, depth=depth, limit=24)
+
+
+def profile_tokens(profile: dict[str, str]) -> tuple[list[str], list[str]]:
+    token_values: list[str] = []
+    date_values: list[str] = []
+    for key, raw_value in profile.items():
+        items = parse_human_list(raw_value)
+        if key == "dates":
+            date_values.extend(items)
+            continue
+        for item in items:
+            extracted = extract_words(item, min_len=1, max_len=32, lowercase=True)
+            if len(extracted) > 1:
+                token_values.append("".join(extracted))
+            token_values.extend(extracted)
+    return ordered_unique(token_values), parse_date_fragments(date_values)
+
+
+def pair_joiners(options: BuildOptions) -> tuple[str, ...]:
+    numeric_joiners = [
+        value
+        for value in [*options.numbers, *options.years]
+        if value and value.isdigit() and len(value) <= 4
+    ]
+    return tuple(ordered_unique([*options.separators, *numeric_joiners[:40], *options.symbols[:8]]))
+
+
+def build_profile_wordlist(profile: dict[str, str], options: BuildOptions) -> list[str]:
+    tokens, dates = profile_tokens(profile)
+    numeric_tokens = [token for token in tokens if token.isdigit()]
+    base_tokens = [token for token in tokens if not token.isdigit()]
+    if not base_tokens:
+        base_tokens = tokens
+    years = ordered_unique([*dates, *options.years])
+    numbers = ordered_unique([*numeric_tokens, *options.numbers])
+    options = replace(options, years=tuple(years), numbers=tuple(numbers))
+    bases: list[str] = []
+    for token in base_tokens:
+        bases.extend(case_variants(token, options.case_modes))
+    bases = ordered_unique(bases)
+    joiners = pair_joiners(options)
+
+    def stream() -> Iterator[str]:
+        yield from bases
+        if options.include_reverse:
+            for base in bases:
+                yield base[::-1]
+        limited_bases = bases[: options.pair_limit]
+        if options.include_pairs:
+            for left, right in itertools.permutations(limited_bases, 2):
+                for joiner in joiners:
+                    yield left + joiner + right
+        suffixes = ordered_unique([*options.years, *options.numbers, *options.symbols])
+        for base in bases:
+            for suffix in suffixes:
+                yield base + suffix
+                if suffix.isdigit():
+                    yield suffix + base
+            for year in options.years:
+                for sep in options.separators:
+                    if sep:
+                        yield base + sep + year
+                if options.include_sandwich:
+                    for symbol in options.symbols:
+                        yield base + year + symbol
+                        yield base + symbol + year
+        if options.include_pairs:
+            for left, right in itertools.permutations(limited_bases, 2):
+                for joiner in joiners:
+                    pair = left + joiner + right
+                    for suffix in options.years[:8]:
+                        yield pair + suffix
+
+    return bounded_unique_candidates(with_leet(stream(), options.leet_depth), options)
+
+
+def mutate_wordlist(words: Sequence[str], options: BuildOptions) -> list[str]:
+    source = ordered_unique(clean_candidate(word) for word in words if clean_candidate(word))
+    numeric_source = [word for word in source if word.isdigit()]
+    word_source = [word for word in source if not word.isdigit()]
+    if word_source:
+        source = word_source
+        options = replace(options, numbers=tuple(ordered_unique([*numeric_source, *options.numbers])))
+    suffixes = ordered_unique([*options.years, *options.numbers, *options.symbols])
+    joiners = pair_joiners(options)
+
+    def stream() -> Iterator[str]:
+        for word in source:
+            yield from case_variants(word, options.case_modes)
+            if options.include_reverse:
+                yield word[::-1]
+            for suffix in suffixes:
+                yield word + suffix
+                if suffix.isdigit():
+                    yield suffix + word
+            for year in options.years:
+                for symbol in options.symbols:
+                    if options.include_sandwich:
+                        yield word + year + symbol
+                        yield word + symbol + year
+        if options.include_pairs:
+            limited = source[: options.pair_limit]
+            for left, right in itertools.permutations(limited, 2):
+                for joiner in joiners:
+                    yield left + joiner + right
+
+    return bounded_unique_candidates(with_leet(stream(), options.leet_depth), options)
+
+
+def generate_passphrases(
+    words: Sequence[str],
+    word_count: int,
+    separators: Sequence[str],
+    options: BuildOptions,
+    source_limit: int = 80,
+) -> list[str]:
+    base_words = [
+        word.lower()
+        for word in words
+        if word.isalpha() and options.min_len <= len(word) <= min(options.max_len, 18)
+    ]
+    base_words = ordered_unique(base_words)[:source_limit]
+    suffixes = ("", *options.years[:6], *options.symbols[:3])
+
+    def stream() -> Iterator[str]:
+        iterator: Iterable[tuple[str, ...]]
+        if len(base_words) >= word_count:
+            iterator = itertools.permutations(base_words, word_count)
+        else:
+            iterator = itertools.product(base_words, repeat=word_count)
+        for combo in iterator:
+            for sep in separators:
+                phrase = sep.join(combo)
+                yield phrase
+                yield phrase.title()
+                for suffix in suffixes:
+                    if suffix:
+                        yield phrase + suffix
+
+    return bounded_unique_candidates(stream(), options)
+
+
+def option_preset(name: str, max_candidates: int | None = None) -> BuildOptions:
+    normalized = normalize_style(name)
+    candidate_limit = max_candidates or DEFAULT_MAX_CANDIDATES
+    if normalized == "focused":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 100_000),
+            case_modes=("raw", "lower", "title", "capitalize"),
+            years=recent_years(5),
+            numbers=DEFAULT_NUMBERS,
+            symbols=("!", "@", "#", "_"),
+            leet_depth=1,
+            pair_limit=50,
+        )
+    if normalized == "quick":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 25_000),
+            case_modes=("raw", "lower", "title"),
+            years=recent_years(2),
+            numbers=("1", "4", "7", "123"),
+            symbols=("!", "@"),
+            leet_depth=0,
+            pair_limit=25,
+        )
+    if normalized == "numbers":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 100_000),
+            case_modes=("raw", "lower", "title", "capitalize"),
+            separators=("",),
+            years=recent_years(5),
+            numbers=DEFAULT_NUMBERS,
+            symbols=(),
+            leet_depth=0,
+            pair_limit=50,
+        )
+    if normalized == "symbols":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 100_000),
+            case_modes=("raw", "lower", "title", "capitalize"),
+            separators=("",),
+            years=(),
+            numbers=(),
+            symbols=DEFAULT_SYMBOLS,
+            leet_depth=0,
+            pair_limit=50,
+            include_sandwich=False,
+        )
+    if normalized == "both":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 150_000),
+            case_modes=("raw", "lower", "title", "capitalize"),
+            years=recent_years(5),
+            numbers=DEFAULT_NUMBERS,
+            symbols=DEFAULT_SYMBOLS,
+            leet_depth=0,
+            pair_limit=50,
+        )
+    if normalized == "caps":
+        return BuildOptions(
+            max_candidates=min(candidate_limit, 25_000),
+            case_modes=("raw", "lower", "upper", "title", "capitalize"),
+            separators=("",),
+            years=(),
+            numbers=(),
+            symbols=(),
+            leet_depth=0,
+            pair_limit=20,
+            include_pairs=False,
+            include_reverse=False,
+            include_sandwich=False,
+        )
+    if normalized == "wide":
+        return BuildOptions(
+            max_candidates=min(max(candidate_limit, 250_000), 500_000),
+            case_modes=("raw", "lower", "upper", "title", "capitalize"),
+            years=recent_years(10),
+            numbers=tuple([str(item) for item in range(0, 100)] + ["123", "1234", "007"]),
+            symbols=("!", "@", "#", "$", "_", "-", "."),
+            leet_depth=2,
+            pair_limit=60,
+        )
+    return BuildOptions(
+        max_candidates=candidate_limit,
+        case_modes=("raw", "lower", "title", "capitalize"),
+        years=recent_years(5),
+        numbers=DEFAULT_NUMBERS,
+        symbols=DEFAULT_SYMBOLS,
+        leet_depth=1,
+        pair_limit=40,
+    )
+
+
+def read_word_file(path: str | Path, token_mode: bool = False) -> list[str]:
+    file_path = Path(path).expanduser()
+    text = file_path.read_text(encoding="utf-8", errors="ignore")
+    if token_mode:
+        return extract_words(text, min_len=1, max_len=64, lowercase=False)
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def harvest_url(url: str, max_bytes: int = 2_000_000, timeout: int = 10) -> str:
+    url = normalize_harvest_target(url)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only http and https URLs are supported.")
+    github_text = harvest_github_profile(url, max_bytes=max_bytes, timeout=timeout)
+    if github_text is not None:
+        return github_text
+    try:
+        text, _links = extract_page_text_and_links(url, max_bytes=max_bytes, timeout=timeout)
+    except HTTPError as exc:
+        hint_text = url_hint_text(url)
+        if hint_text:
+            return hint_text
+        raise ValueError(f"URL returned HTTP {exc.code}: {exc.reason}") from exc
+    except URLError as exc:
+        hint_text = url_hint_text(url)
+        if hint_text:
+            return hint_text
+        raise ValueError(f"Could not reach URL: {exc.reason}") from exc
+    return text
+
+
+def parse_mask(mask: str, custom: dict[str, str] | None = None) -> list[str]:
+    custom = custom or {}
+    parts: list[str] = []
+    index = 0
+    while index < len(mask):
+        char = mask[index]
+        if char != "?":
+            parts.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(mask):
+            raise ValueError("Dangling '?' at end of mask.")
+        token = mask[index + 1]
+        if token == "?":
+            parts.append("?")
+        elif token in custom:
+            if not custom[token]:
+                raise ValueError(f"Custom charset ?{token} is empty.")
+            parts.append(custom[token])
+        elif token in BUILTIN_MASK_CHARSETS:
+            parts.append(BUILTIN_MASK_CHARSETS[token])
+        else:
+            raise ValueError(f"Unsupported mask token '?{token}'.")
+        index += 2
+    return parts
+
+
+def mask_keyspace(mask: str, custom: dict[str, str] | None = None) -> int:
+    total = 1
+    for part in parse_mask(mask, custom):
+        total *= len(part)
+    return total
+
+
+def generate_from_mask(
+    mask: str,
+    custom: dict[str, str] | None = None,
+    limit: int = DEFAULT_MAX_CANDIDATES,
+) -> list[str]:
+    parts = parse_mask(mask, custom)
+    candidates: list[str] = []
+    for combo in itertools.product(*parts):
+        candidates.append("".join(combo))
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def hashcat_append_rule(value: str) -> str:
+    return "".join(f"${char}" for char in value)
+
+
+def hashcat_prepend_rule(value: str) -> str:
+    return "".join(f"^{char}" for char in reversed(value))
+
+
+def generate_hashcat_rules(years: Sequence[str], symbols: Sequence[str]) -> list[str]:
+    rules = [":", "l", "u", "c", "C", "r"]
+    for symbol in symbols:
+        rules.append(hashcat_append_rule(symbol))
+    for year in years:
+        rules.append(hashcat_append_rule(year))
+        rules.append(hashcat_prepend_rule(year))
+        for symbol in symbols[:4]:
+            rules.append(hashcat_append_rule(year + symbol))
+            rules.append(hashcat_append_rule(symbol + year))
+    return ordered_unique(rules)
+
+
+def escape_mask_literal(value: str) -> str:
+    return "".join("??" if char == "?" else char for char in value)
+
+
+def generate_huge_masks(
+    words: Sequence[str],
+    digit_lengths: Sequence[int],
+    symbol_count: int = 0,
+    case_modes: Sequence[str] = ("raw", "lower", "title", "capitalize"),
+    known_digits: str = "",
+    known_suffix: str = "",
+    limit: int = 500,
+) -> list[str]:
+    bases: list[str] = []
+    for word in words:
+        cleaned = clean_candidate(word)
+        if not cleaned:
+            continue
+        bases.extend(case_variants(cleaned, case_modes))
+    bases = ordered_unique(bases)
+    lengths = ordered_unique(str(length) for length in digit_lengths if length >= 0)
+    if known_digits:
+        lengths = [str(len(known_digits))]
+
+    masks: list[str] = []
+    for base in bases:
+        base_mask = escape_mask_literal(base)
+        for raw_length in lengths:
+            digit_part = escape_mask_literal(known_digits) if known_digits else "?d" * int(raw_length)
+            suffix_part = escape_mask_literal(known_suffix) if known_suffix else "?s" * max(0, symbol_count)
+            masks.append(base_mask + digit_part + suffix_part)
+            if len(masks) >= limit:
+                return ordered_unique(masks)[:limit]
+    return ordered_unique(masks)[:limit]
+
+
+def estimate_mask_collection_keyspace(masks: Sequence[str]) -> int:
+    total = 0
+    for mask in masks:
+        total += mask_keyspace(mask)
+    return total
+
+
+def format_count(value: int | float) -> str:
+    if isinstance(value, float):
+        return f"{value:,.1f}"
+    return f"{value:,}"
+
+
+def banner() -> str:
+    art = r"""
+ __        __   ___              _   _   _
+ \ \      / /  / _ \  _ __  __| | | | | | |_
+  \ \ /\ / /  | | | || '__|/ _` | | | | | __|
+   \ V  V /   | |_| || |  | (_| | |_| |_| |_
+    \_/\_/     \___/ |_|   \__,_| (_) (_)\__|
+"""
+    lines = [
+        color(art.rstrip("\n"), "bold", "cyan"),
+        color(f"                         {APP_NAME} v{VERSION}", "bold", "green"),
+        color(f"                      created by {CREATOR_NAME}", "cyan"),
+        color("          Build useful candidates from the hints you actually have.", "green"),
+        "",
+        color("       =[ profiles ]====[ mutations ]====[ masks ]====[ rules ]=", "magenta"),
+        color("       =[ authorized password recovery, auditing, CTFs, and labs ]=", "yellow"),
+    ]
+    return "\n".join(lines)
+
+
+class WorditShell(cmd.Cmd):
+    intro = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bank = WordBank()
+        self.default_min_len = DEFAULT_MIN_LEN
+        self.default_max_len = DEFAULT_MAX_LEN
+        self.default_max_candidates = DEFAULT_MAX_CANDIDATES
+        self.menu_mode = "main"
+        self.loaded_ai_config = load_ai_config()
+        self.update_prompt()
+        self.intro = f"{banner()}\n\n{self.menu_text()}"
+
+    def update_prompt(self) -> None:
+        label = f"{APP_NAME} > " if self.menu_mode == "main" else f"{APP_NAME} advanced > "
+        self.prompt = color(label, "bold", "green")
+
+    def emptyline(self) -> None:
+        return None
+
+    def default(self, line: str) -> bool | None:
+        line = line.strip()
+        if line.isdigit():
+            return self.do_use(line)
+        print(f"Unknown command: {line}. Try 'menu' or 'help'.")
+
+    def menu_text(self) -> str:
+        items = [
+            ("1", "Create wordlist from hints"),
+            ("2", "Add words manually"),
+            ("3", "Import a wordlist file"),
+            ("4", "Improve / mutate current list"),
+            ("5", "Preview current list"),
+            ("6", "Save wordlist"),
+            ("7", "Show stats"),
+            ("8", "Advanced options"),
+            ("9", "Clear session"),
+            ("0", "Exit"),
+        ]
+        lines = [color("Main menu", "bold", "magenta")]
+        lines.extend(f"  {color(f'[{key}]', 'yellow')} {label}" for key, label in items)
+        lines.append(color("Tip: type a number, or type a command like add, mutate, preview, save.", "dim"))
+        lines.append(color("     Press Tab when a prompt asks for a file path.", "dim"))
+        return "\n".join(lines)
+
+    def advanced_menu_text(self) -> str:
+        items = [
+            ("1", "Harvest words from text file or URL"),
+            ("2", "Huge password patterns"),
+            ("3", "AI smart harvest"),
+            ("4", "AI API setup"),
+            ("5", "Generate from a mask"),
+            ("6", "Build passphrases"),
+            ("7", "Advanced mutation settings"),
+            ("8", "Export helpers"),
+            ("0", "Back to main menu"),
+            ("9", "Exit"),
+        ]
+        lines = [color("Advanced options", "bold", "magenta")]
+        lines.extend(f"  {color(f'[{key}]', 'yellow')} {label}" for key, label in items)
+        lines.append(color("Tip: 0 goes back. Type menu for main, advanced for this screen.", "dim"))
+        return "\n".join(lines)
+
+    def do_help(self, arg: str) -> None:
+        print(
+            textwrap.dedent(
+                """
+                Core commands:
+                  menu                 Show the main menu
+                  advanced             Show advanced options
+                  back                 Return to the main menu
+                  profile              Guided hint-based wordlist builder
+                  add WORDS...         Add manual words or phrases
+                  import PATH          Import one candidate per line
+                  mutate [style]       Mutate current list
+                  stats                Show counts and length summary
+                  preview [N]          Show the first N candidates
+                  save PATH            Write current wordlist
+                  clear                Clear current session
+                  exit                 Quit
+
+                Mutation styles: focused, numbers, symbols, both, caps, quick, wide.
+                Advanced commands: harvest, huge, aiharvest, aisetup, mask, passphrase, rules, hcmask.
+
+                Mask tokens: ?l lower, ?u upper, ?d digit, ?s symbol, ?a all,
+                ?h lowercase hex, ?H uppercase hex, ?1-?4 custom charsets.
+                """
+            ).strip()
+        )
+
+    def complete_import(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def complete_load(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return self.complete_import(text, line, begidx, endidx)
+
+    def complete_harvest(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def complete_save(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def complete_rules(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def complete_hcmask(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def do_menu(self, arg: str) -> None:
+        self.menu_mode = "main"
+        self.update_prompt()
+        print(self.menu_text())
+
+    def do_advanced(self, arg: str) -> None:
+        self.menu_mode = "advanced"
+        self.update_prompt()
+        print(self.advanced_menu_text())
+
+    def do_adv(self, arg: str) -> None:
+        self.do_advanced(arg)
+
+    def do_back(self, arg: str) -> None:
+        self.do_menu(arg)
+
+    def do_main(self, arg: str) -> None:
+        self.do_menu(arg)
+
+    def do_use(self, arg: str) -> bool | None:
+        main_actions = {
+            "1": self.do_profile,
+            "2": self.do_add,
+            "3": self.do_import,
+            "4": self.do_mutate,
+            "5": self.do_preview,
+            "6": self.do_save,
+            "7": self.do_stats,
+            "8": self.do_advanced,
+            "9": self.do_clear,
+            "0": self.do_exit,
+        }
+        advanced_actions = {
+            "1": self.do_harvest,
+            "2": self.do_huge,
+            "3": self.do_aiharvest,
+            "4": self.do_aisetup,
+            "5": self.do_mask,
+            "6": self.do_passphrase,
+            "7": self.do_mutate_advanced,
+            "8": self.do_export_helpers,
+            "0": self.do_back,
+            "9": self.do_exit,
+        }
+        actions = advanced_actions if self.menu_mode == "advanced" else main_actions
+        action = actions.get(arg.strip())
+        if not action:
+            if self.menu_mode == "advanced":
+                print("No such advanced menu item. Use 0 to go back, or type advanced to show options.")
+            else:
+                print("No such menu item.")
+            return
+        result = action("")
+        return result if isinstance(result, bool) else None
+
+    def ask(self, prompt: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{prompt}{suffix}: ").strip()
+        return value if value else default
+
+    def ask_secret(self, prompt: str, default: str = "") -> str:
+        suffix = f" [{mask_secret(default)}]" if default else ""
+        if not sys.stdin.isatty():
+            value = input(f"{prompt}{suffix}: ").strip()
+            return value if value else default
+        value = getpass.getpass(f"{prompt}{suffix}: ").strip()
+        return value if value else default
+
+    def ask_path(
+        self,
+        prompt: str,
+        default: str = "",
+        include_files: bool = True,
+        include_dirs: bool = True,
+    ) -> str:
+        suffix = f" [{default}]" if default else ""
+        if readline is None or not sys.stdin.isatty():
+            value = input(f"{prompt}{suffix}: ").strip()
+            return value if value else default
+
+        old_completer = readline.get_completer()
+        old_delims = readline.get_completer_delims()
+
+        def complete_path(text: str, state: int) -> str | None:
+            matches = path_completions(
+                text,
+                include_files=include_files,
+                include_dirs=include_dirs,
+            )
+            if state < len(matches):
+                return matches[state]
+            return None
+
+        try:
+            readline.set_completer_delims("\t\n")
+            readline.set_completer(complete_path)
+            readline.parse_and_bind("tab: complete")
+            value = input(f"{prompt}{suffix}: ").strip()
+            return value if value else default
+        finally:
+            readline.set_completer(old_completer)
+            readline.set_completer_delims(old_delims)
+
+    def ask_int(self, prompt: str, default: int, minimum: int = 0) -> int:
+        while True:
+            raw = self.ask(prompt, str(default))
+            try:
+                value = int(raw)
+            except ValueError:
+                print("Enter a number.")
+                continue
+            if value < minimum:
+                print(f"Enter {minimum} or higher.")
+                continue
+            return value
+
+    def ask_bool(self, prompt: str, default: bool = False) -> bool:
+        marker = "Y/n" if default else "y/N"
+        raw = input(f"{prompt} [{marker}]: ").strip().lower()
+        if not raw:
+            return default
+        return raw in {"y", "yes", "true", "1"}
+
+    def ask_choice(self, prompt: str, choices: Sequence[str], default: str) -> str:
+        choice_set = set(choices)
+        while True:
+            raw = self.ask(f"{prompt} ({'/'.join(choices)})", default).lower()
+            if raw in choice_set:
+                return raw
+            print(f"Choose one of: {', '.join(choices)}.")
+
+    def print_mutation_styles(self) -> None:
+        print(color("Mutation styles", "bold", "magenta"))
+        print("  focused  best first try: words, caps, numbers, symbols, and word+number+word")
+        print("  numbers  add digits only")
+        print("  symbols  add special characters only")
+        print("  both     add numbers and special characters")
+        print("  caps     capitalization variants only")
+        print("  quick    smaller and faster")
+        print("  wide     larger search space")
+
+    def ask_mutation_style(self, default: str = "focused") -> str:
+        self.print_mutation_styles()
+        while True:
+            raw = self.ask("Style", default)
+            style = normalize_style(raw)
+            if style in MUTATION_STYLES or style == "balanced":
+                return style
+            print(f"Unknown style: {raw}.")
+
+    def simple_options_from_prompt(self, style: str) -> BuildOptions:
+        size = self.ask_choice("Wordlist size", ("small", "medium", "large"), "medium")
+        return option_preset(style, WORDLIST_SIZE_CAPS[size])
+
+    def options_from_prompt(self, preset: str) -> BuildOptions:
+        options = option_preset(preset, self.default_max_candidates)
+        min_len = self.ask_int("Minimum length", options.min_len, minimum=1)
+        max_len = self.ask_int("Maximum length", options.max_len, minimum=min_len)
+        max_candidates = self.ask_int(
+            "Candidate cap",
+            options.max_candidates,
+            minimum=1,
+        )
+        use_numbers = self.ask_bool("Use numbers", bool(options.numbers or options.years))
+        use_symbols = self.ask_bool("Use special characters", bool(options.symbols))
+        use_capitals = self.ask_bool(
+            "Use capitalization variants",
+            any(mode in options.case_modes for mode in ("upper", "title", "capitalize")),
+        )
+        combine_words = self.ask_bool("Combine two hint words", options.include_pairs)
+        use_leet = self.ask_bool("Use leetspeak swaps like a -> 4", options.leet_depth > 0)
+        numbers = options.numbers if use_numbers else ()
+        years = options.years if use_numbers else ()
+        if use_numbers and not years:
+            years = recent_years(5)
+        symbols = options.symbols if use_symbols else ()
+        case_modes = ("raw", "lower", "upper", "title", "capitalize") if use_capitals else ("raw", "lower")
+        leet_depth = options.leet_depth if use_leet else 0
+        return replace(
+            options,
+            min_len=min_len,
+            max_len=max_len,
+            max_candidates=max_candidates,
+            numbers=numbers,
+            years=years,
+            symbols=symbols,
+            case_modes=case_modes,
+            include_pairs=combine_words,
+            include_sandwich=use_numbers and use_symbols,
+            leet_depth=leet_depth,
+        )
+
+    def report_added(self, added: int) -> None:
+        print(color(f"Added {format_count(added)} new candidates.", "green"))
+        print(f"Session total: {format_count(len(self.bank))}.")
+
+    def do_profile(self, arg: str) -> None:
+        print(color("Create from hints", "bold", "magenta"))
+        print("Use only for systems and accounts you are authorized to assess.")
+        profile = {
+            "names": self.ask("Important words, names, handles, teams"),
+            "dates": self.ask("Numbers, dates, years"),
+            "places": self.ask("Places, projects, products"),
+            "extras": self.ask("Extra hints"),
+        }
+        style = self.ask_mutation_style("focused")
+        options = self.simple_options_from_prompt(style)
+        candidates = build_profile_wordlist(profile, options)
+        added = self.bank.add_many(candidates, source=f"profile:{style}")
+        self.report_added(added)
+
+    def do_add(self, arg: str) -> None:
+        raw = arg.strip() or self.ask("Words or phrases")
+        items = parse_human_list(raw)
+        expanded: list[str] = []
+        for item in items:
+            tokens = extract_words(item, min_len=1, max_len=64, lowercase=False)
+            if len(tokens) > 1:
+                expanded.append("".join(tokens))
+            expanded.extend(tokens or [item])
+        added = self.bank.add_many(expanded, source="manual")
+        self.report_added(added)
+
+    def do_import(self, arg: str) -> None:
+        path = arg.strip() or self.ask_path("Path to wordlist")
+        if Path(path).expanduser().is_dir():
+            print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
+            return
+        token_mode = self.ask_bool("Extract tokens instead of one word per line", False)
+        try:
+            words = read_word_file(path, token_mode=token_mode)
+        except IsADirectoryError:
+            print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
+            return
+        except OSError as exc:
+            print(f"Could not read file: {exc}")
+            return
+        added = self.bank.add_many(words, source=f"import:{Path(path).name}")
+        self.report_added(added)
+
+    def do_load(self, arg: str) -> None:
+        self.do_import(arg)
+
+    def do_harvest(self, arg: str) -> None:
+        target = normalize_harvest_target(arg.strip() or self.ask_path("Text file path or URL"))
+        target_is_url = target.startswith(("http://", "https://"))
+        if not target_is_url and Path(target).expanduser().is_dir():
+            print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
+            return
+        min_len = self.ask_int("Minimum harvested word length", 3, minimum=1)
+        max_len = self.ask_int("Maximum harvested word length", 32, minimum=min_len)
+        try:
+            if target_is_url:
+                if not self.ask_bool("Confirm this URL is in scope for you", False):
+                    print("Skipped URL harvest.")
+                    return
+                text = harvest_url(target)
+                source = f"url:{urlparse(target).netloc}"
+            else:
+                text = Path(target).expanduser().read_text(encoding="utf-8", errors="ignore")
+                source = f"harvest:{Path(target).name}"
+        except IsADirectoryError:
+            print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
+            return
+        except (OSError, ValueError) as exc:
+            print(f"Harvest failed: {exc}")
+            return
+        words = extract_words(text, min_len=min_len, max_len=max_len, lowercase=True)
+        if not words:
+            if target_is_url:
+                print("No words were found. Check that the URL exists, is public, and is not rendered only by JavaScript.")
+            else:
+                print("No words were found in that file with the selected length limits.")
+            return
+        added = self.bank.add_many(words, source=source)
+        if added == 0:
+            print("No new candidates added; the harvested words were already in this session.")
+            return
+        self.report_added(added)
+
+    def do_aiharvest(self, arg: str) -> None:
+        print(color("AI smart harvest", "bold", "magenta"))
+        print("Crawls a small authorized scope, then asks an optional AI provider for useful seed words.")
+        target = normalize_harvest_target(arg.strip() or self.ask_path("Start URL"))
+        if not target.startswith(("http://", "https://")):
+            print("AI smart harvest needs an http or https URL.")
+            return
+        if not self.ask_bool("Confirm this URL and linked pages are in scope for you", False):
+            print("Skipped AI smart harvest.")
+            return
+        max_pages = min(self.ask_int("Maximum pages to fetch", 3, minimum=1), 10)
+        max_depth = min(self.ask_int("Link depth", 1, minimum=0), 3)
+        same_host = self.ask_bool("Stay on the same host", True)
+        provider = self.ask("AI provider openai/gemini/off", "off").strip().lower()
+        if provider in {"none", "no", "n"}:
+            provider = "off"
+        model = ""
+        if provider != "off":
+            model = self.ask("Model override (blank = provider default)")
+
+        text, fetched, errors = crawl_url_text(
+            target,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            same_host_only=same_host,
+        )
+        if fetched:
+            print(f"Fetched {format_count(len(fetched))} page(s).")
+        if errors:
+            print("Fetch notes:")
+            for error in errors[:5]:
+                print(f"  {error}")
+        normal_words = extract_words(text, min_len=2, max_len=32, lowercase=True)
+        ai_words: list[str] = []
+        if provider != "off":
+            try:
+                ai_words = ai_extract_keywords(provider, text, max_keywords=100, model=model)
+            except ValueError as exc:
+                print(f"AI enrichment skipped: {exc}")
+                if provider == "openai":
+                    print("Run AI API setup from Advanced options to enable OpenAI enrichment.")
+                elif provider == "gemini":
+                    print("Run AI API setup from Advanced options to enable Gemini enrichment.")
+        combined = ordered_unique([*normal_words, *ai_words])
+        if not combined:
+            print("No words were found. Check that the URL is public and reachable.")
+            return
+        added = self.bank.add_many(combined, source=f"aiharvest:{provider}")
+        if added == 0:
+            print("No new candidates added; the harvested words were already in this session.")
+            return
+        self.report_added(added)
+
+    def do_ai(self, arg: str) -> None:
+        self.do_aiharvest(arg)
+
+    def do_aisetup(self, arg: str) -> None:
+        print(color("AI API setup", "bold", "magenta"))
+        print(f"OpenAI key: {mask_secret(os.environ.get('OPENAI_API_KEY', ''))}")
+        print(f"Gemini key: {mask_secret(os.environ.get('GEMINI_API_KEY', ''))}")
+        provider = self.ask_choice("Provider", ("openai", "gemini"), "openai")
+        provider_label = ai_provider_label(provider)
+        if provider == "openai":
+            key_env = "OPENAI_API_KEY"
+            model_env = "W0RDIT_OPENAI_MODEL"
+            default_model = "gpt-4.1-mini"
+        else:
+            key_env = "GEMINI_API_KEY"
+            model_env = "W0RDIT_GEMINI_MODEL"
+            default_model = "gemini-2.5-flash"
+
+        current_key = os.environ.get(key_env, "")
+        key = self.ask_secret(f"{provider_label} API key", current_key)
+        if not key:
+            print("No key entered.")
+            return
+        os.environ[key_env] = key
+
+        current_model = os.environ.get(model_env, "")
+        model = self.ask("Default model", current_model or default_model)
+        if model:
+            os.environ[model_env] = model
+        else:
+            os.environ.pop(model_env, None)
+
+        print(f"{provider_label} is configured for this session.")
+        if self.ask_bool("Save for future w0rd!t sessions", False):
+            values = {key_env: key}
+            if model:
+                values[model_env] = model
+            path = write_ai_config(values)
+            print(f"Saved AI settings to {path} with permissions 600.")
+        else:
+            print("Not saved. This key will disappear when you exit w0rd!t.")
+
+    def do_aiapi(self, arg: str) -> None:
+        self.do_aisetup(arg)
+
+    def do_api(self, arg: str) -> None:
+        self.do_aisetup(arg)
+
+    def do_mutate(self, arg: str) -> None:
+        if not self.bank:
+            print("Add or import words first.")
+            return
+        if arg.strip().lower() in {"advanced", "adv"}:
+            self.do_mutate_advanced("")
+            return
+        style = normalize_style(arg.strip()) if arg.strip() else self.ask_mutation_style("focused")
+        if style not in MUTATION_STYLES and style != "balanced":
+            print(f"Unknown mutation style: {arg.strip()}.")
+            return
+        options = self.simple_options_from_prompt(style)
+        candidates = mutate_wordlist(self.bank.words(), options)
+        added = self.bank.add_many(candidates, source=f"mutate:{style}")
+        self.report_added(added)
+
+    def do_mutate_advanced(self, arg: str) -> None:
+        if not self.bank:
+            print("Add or import words first.")
+            return
+        style = self.ask_mutation_style("focused")
+        options = self.options_from_prompt(style)
+        candidates = mutate_wordlist(self.bank.words(), options)
+        added = self.bank.add_many(candidates, source=f"mutate-advanced:{style}")
+        self.report_added(added)
+
+    def do_huge(self, arg: str) -> None:
+        print(color("Huge password patterns", "bold", "magenta"))
+        print("For very large spaces, w0rd!t writes masks instead of giant text files.")
+        raw_bases = arg.strip()
+        if not raw_bases:
+            default_hint = "blank uses current words" if self.bank else "example: kista"
+            raw_bases = self.ask(f"Base words ({default_hint})")
+        if raw_bases:
+            bases: list[str] = []
+            for item in parse_human_list(raw_bases):
+                bases.extend(extract_words(item, min_len=1, max_len=64, lowercase=False) or [item])
+        else:
+            bases = self.bank.words()
+        bases = ordered_unique(bases)
+        if not bases:
+            print("Add words first, or enter base words like kista.")
+            return
+
+        known_digits = self.ask("Known digit chunk (blank = any digits)")
+        if known_digits and not known_digits.isdigit():
+            print("Known digit chunk must contain digits only.")
+            return
+        if known_digits:
+            min_digits = max_digits = len(known_digits)
+        else:
+            min_digits = self.ask_int("Minimum trailing digits", 8, minimum=0)
+            max_digits = self.ask_int("Maximum trailing digits", max(9, min_digits), minimum=min_digits)
+        known_suffix = self.ask("Known exact ending (blank = any symbols)")
+        symbol_count = 0
+        if not known_suffix:
+            symbol_count = self.ask_int("Trailing symbols", 2, minimum=0)
+        use_capitals = self.ask_bool("Try capitalization variants", True)
+        path = self.ask_path("Mask output path", "w0rdit-huge.hcmask")
+
+        case_modes = ("raw", "lower", "upper", "title", "capitalize") if use_capitals else ("raw", "lower")
+        digit_lengths = range(min_digits, max_digits + 1)
+        masks = generate_huge_masks(
+            bases,
+            digit_lengths=digit_lengths,
+            symbol_count=symbol_count,
+            case_modes=case_modes,
+            known_digits=known_digits,
+            known_suffix=known_suffix,
+        )
+        try:
+            Path(path).expanduser().write_text("\n".join(masks) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not write masks: {exc}")
+            return
+
+        total = estimate_mask_collection_keyspace(masks)
+        print(f"Wrote {format_count(len(masks))} huge-pattern masks to {path}.")
+        print(f"Estimated represented keyspace: {format_count(total)} candidates.")
+        if masks:
+            print(f"Example mask: {masks[0]}")
+
+    def do_mask(self, arg: str) -> None:
+        mask = arg.strip() or self.ask("Mask")
+        custom: dict[str, str] = {}
+        for index in range(1, 5):
+            value = self.ask(f"Custom ?{index} charset (blank skips)")
+            if value:
+                custom[str(index)] = value
+        try:
+            count = mask_keyspace(mask, custom)
+        except ValueError as exc:
+            print(f"Invalid mask: {exc}")
+            return
+        print(f"Mask keyspace: {format_count(count)} candidates.")
+        limit_default = min(count, self.default_max_candidates)
+        if count > self.default_max_candidates:
+            if not self.ask_bool(f"Generate only the first {format_count(limit_default)} candidates", False):
+                print("Skipped generation. Use hcmask to export the pattern instead.")
+                return
+        limit = self.ask_int("Generation limit", int(limit_default), minimum=1)
+        candidates = generate_from_mask(mask, custom, limit=limit)
+        added = self.bank.add_many(candidates, source="mask")
+        self.report_added(added)
+
+    def do_passphrase(self, arg: str) -> None:
+        if not self.bank:
+            print("Add or import source words first.")
+            return
+        count = self.ask_int("Words per passphrase", 3, minimum=2)
+        raw_separators = self.ask("Separators, comma separated", "-,_,.")
+        separators = tuple(item for item in parse_human_list(raw_separators) if item)
+        style = self.ask("Style focused/quick/wide", "quick").lower()
+        options = self.options_from_prompt(style)
+        candidates = generate_passphrases(
+            self.bank.words(),
+            word_count=count,
+            separators=separators or ("-",),
+            options=options,
+        )
+        added = self.bank.add_many(candidates, source="passphrase")
+        self.report_added(added)
+
+    def do_rules(self, arg: str) -> None:
+        path = arg.strip() or self.ask_path("Rule output path", "w0rdit.rule")
+        style = self.ask("Style focused/quick/wide", "focused").lower()
+        options = option_preset(style)
+        rules = generate_hashcat_rules(options.years, options.symbols)
+        try:
+            Path(path).expanduser().write_text("\n".join(rules) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not write rules: {exc}")
+            return
+        print(f"Wrote {format_count(len(rules))} rules to {path}.")
+
+    def do_hcmask(self, arg: str) -> None:
+        path = arg.strip() or self.ask_path("Mask output path", "w0rdit.hcmask")
+        top_words = [
+            word
+            for word in self.bank.words()[:50]
+            if word and all(char not in word for char in ",\n\r")
+        ]
+        if not top_words:
+            top_words = ["password", "summer", "welcome"]
+        masks: list[str] = []
+        for word in top_words:
+            masks.extend(
+                [
+                    f"{word}?d?d",
+                    f"{word}?d?d?d?d",
+                    f"{word}?s?d?d",
+                    f"{word}?d?d?s",
+                ]
+            )
+        try:
+            Path(path).expanduser().write_text("\n".join(ordered_unique(masks)) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not write masks: {exc}")
+            return
+        print(f"Wrote {format_count(len(ordered_unique(masks)))} masks to {path}.")
+
+    def do_export_helpers(self, arg: str) -> None:
+        choice = self.ask_choice("Export", ("rules", "hcmask", "both"), "both")
+        if choice in {"rules", "both"}:
+            self.do_rules("")
+        if choice in {"hcmask", "both"}:
+            self.do_hcmask("")
+
+    def do_stats(self, arg: str) -> None:
+        stats = self.bank.stats()
+        print(f"Candidates: {format_count(stats['count'])}")
+        print(f"Length: min {stats['min']}, max {stats['max']}, avg {format_count(stats['avg'])}")
+        sources = stats["sources"]
+        if isinstance(sources, Counter) and sources:
+            print("Sources:")
+            for source, count in sources.most_common(8):
+                print(f"  {source}: {format_count(count)}")
+
+    def do_preview(self, arg: str) -> None:
+        count = 20
+        if arg.strip():
+            try:
+                count = int(arg.strip())
+            except ValueError:
+                print("Usage: preview [count]")
+                return
+        if not self.bank:
+            print("No candidates yet.")
+            return
+        for index, word in enumerate(self.bank.words()[:count], start=1):
+            print(f"{index:>5}  {word}")
+
+    def do_save(self, arg: str) -> None:
+        if not self.bank:
+            print("No candidates to save.")
+            return
+        path = arg.strip() or self.ask_path("Output path", "w0rdit.txt")
+        sort_words = self.ask_bool("Sort alphabetically", False)
+        words = sorted(self.bank.words()) if sort_words else self.bank.words()
+        try:
+            Path(path).expanduser().write_text("\n".join(words) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"Could not save file: {exc}")
+            return
+        print(f"Wrote {format_count(len(words))} candidates to {path}.")
+
+    def do_clear(self, arg: str) -> None:
+        if self.ask_bool("Clear current session", False):
+            self.bank.clear()
+            print("Session cleared.")
+
+    def do_exit(self, arg: str) -> bool:
+        print("Later. Build sharp, test only where authorized.")
+        return True
+
+    def do_quit(self, arg: str) -> bool:
+        return self.do_exit(arg)
+
+    def do_EOF(self, arg: str) -> bool:
+        print()
+        return self.do_exit(arg)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Interactive and scriptable wordlist builder for authorized security work.",
+    )
+    parser.add_argument("--add", action="append", default=[], help="Seed words or phrases.")
+    parser.add_argument("--import-file", action="append", default=[], help="Import a wordlist file.")
+    parser.add_argument("--harvest-file", action="append", default=[], help="Extract words from a text file.")
+    parser.add_argument("--harvest-url", action="append", default=[], help="Extract words from a single in-scope URL.")
+    parser.add_argument("--profile", help="Comma-separated hint words for focused generation.")
+    parser.add_argument(
+        "--mutate",
+        choices=("focused", "numbers", "symbols", "both", "caps", "quick", "balanced", "wide"),
+        help="Mutate loaded words with a named style.",
+    )
+    parser.add_argument("--mask", help="Generate candidates from a hashcat-style mask.")
+    parser.add_argument("--custom1", help="Custom ?1 charset for --mask.")
+    parser.add_argument("--custom2", help="Custom ?2 charset for --mask.")
+    parser.add_argument("--custom3", help="Custom ?3 charset for --mask.")
+    parser.add_argument("--custom4", help="Custom ?4 charset for --mask.")
+    parser.add_argument("--passphrase", type=int, help="Build passphrases with N words.")
+    parser.add_argument("-o", "--output", help="Write candidates to this file and exit.")
+    parser.add_argument("--rules-out", help="Write hashcat-compatible rules and exit.")
+    parser.add_argument("--hcmask-out", help="Write hcmask templates and exit.")
+    parser.add_argument("--min-len", type=int, default=DEFAULT_MIN_LEN)
+    parser.add_argument("--max-len", type=int, default=DEFAULT_MAX_LEN)
+    parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES)
+    parser.add_argument("--i-understand", action="store_true", help="Confirm URL harvesting is authorized.")
+    return parser
+
+
+def run_noninteractive(args: argparse.Namespace) -> int:
+    bank = WordBank()
+    options = replace(
+        option_preset(args.mutate or "focused", args.max_candidates),
+        min_len=args.min_len,
+        max_len=args.max_len,
+        max_candidates=args.max_candidates,
+    )
+
+    for raw in args.add:
+        words: list[str] = []
+        for item in parse_human_list(raw):
+            words.extend(extract_words(item, min_len=1, max_len=64, lowercase=False) or [item])
+        bank.add_many(words, source="manual")
+    for path in args.import_file:
+        bank.add_many(read_word_file(path), source=f"import:{Path(path).name}")
+    for path in args.harvest_file:
+        text = Path(path).expanduser().read_text(encoding="utf-8", errors="ignore")
+        bank.add_many(extract_words(text, min_len=args.min_len, max_len=args.max_len), source="harvest:file")
+    for url in args.harvest_url:
+        if not args.i_understand:
+            raise SystemExit("--harvest-url requires --i-understand to confirm authorization.")
+        try:
+            harvested = harvest_url(url)
+        except ValueError as exc:
+            raise SystemExit(f"Harvest failed: {exc}") from exc
+        bank.add_many(extract_words(harvested, min_len=args.min_len, max_len=args.max_len), source="harvest:url")
+    if args.profile:
+        profile = {"extras": args.profile, "dates": args.profile}
+        bank.add_many(build_profile_wordlist(profile, options), source="profile")
+    if args.mask:
+        custom = {
+            key: value
+            for key, value in {
+                "1": args.custom1,
+                "2": args.custom2,
+                "3": args.custom3,
+                "4": args.custom4,
+            }.items()
+            if value
+        }
+        count = mask_keyspace(args.mask, custom)
+        if count > args.max_candidates:
+            print(f"Mask keyspace is {format_count(count)}; generating first {format_count(args.max_candidates)}.")
+        bank.add_many(generate_from_mask(args.mask, custom, limit=args.max_candidates), source="mask")
+    if args.mutate:
+        bank.add_many(mutate_wordlist(bank.words(), options), source=f"mutate:{args.mutate}")
+    if args.passphrase:
+        bank.add_many(
+            generate_passphrases(bank.words(), args.passphrase, ("-", "_", "."), options),
+            source="passphrase",
+        )
+    if args.rules_out:
+        rules = generate_hashcat_rules(options.years, options.symbols)
+        Path(args.rules_out).expanduser().write_text("\n".join(rules) + "\n", encoding="utf-8")
+        print(f"Wrote {format_count(len(rules))} rules to {args.rules_out}.")
+    if args.hcmask_out:
+        masks = []
+        for word in (bank.words()[:50] or ["password", "summer", "welcome"]):
+            masks.extend([f"{word}?d?d", f"{word}?d?d?d?d", f"{word}?s?d?d", f"{word}?d?d?s"])
+        Path(args.hcmask_out).expanduser().write_text("\n".join(ordered_unique(masks)) + "\n", encoding="utf-8")
+        print(f"Wrote {format_count(len(ordered_unique(masks)))} masks to {args.hcmask_out}.")
+    if args.output:
+        Path(args.output).expanduser().write_text("\n".join(bank.words()) + "\n", encoding="utf-8")
+        print(f"Wrote {format_count(len(bank))} candidates to {args.output}.")
+    elif any(
+        [
+            args.add,
+            args.import_file,
+            args.harvest_file,
+            args.harvest_url,
+            args.profile,
+            args.mask,
+            args.mutate,
+            args.passphrase,
+        ]
+    ):
+        for word in bank.words():
+            print(word)
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    noninteractive = any(
+        [
+            args.add,
+            args.import_file,
+            args.harvest_file,
+            args.harvest_url,
+            args.profile,
+            args.mask,
+            args.mutate,
+            args.passphrase,
+            args.output,
+            args.rules_out,
+            args.hcmask_out,
+        ]
+    )
+    if noninteractive:
+        return run_noninteractive(args)
+    try:
+        WorditShell().cmdloop()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

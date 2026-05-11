@@ -1,0 +1,1 @@
+# w0rd!t uses only the Python standard library.

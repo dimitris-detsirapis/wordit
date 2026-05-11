@@ -1,0 +1,43 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and AI provider config
+.env
+*.env
+ai.env
+
+# Generated wordlists, masks, and rule exports
+*.wordlist
+*.words
+*.lst
+*.hcmask
+*.rule
+w0rdit*.txt
+wordit*.txt
+words.txt
+expanded.txt
+harvested.txt
+mask.txt
+custom-mask.txt
+test.txt
+check.txt
+9
+
+# Local scratch or unrelated lab files
+root.py
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
