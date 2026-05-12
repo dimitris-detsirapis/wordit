@@ -24,13 +24,9 @@ assess.
 - Per-type validation so generated candidates match their target tools.
 - URL and file harvesting with GitHub profile support.
 - Optional bounded recursive harvest with AI keyword enrichment.
-<<<<<<< HEAD
 - Huge-pattern `.hcmask` export for shapes like `Tester` + 9 digits + 2 symbols.
-=======
 - Optional AI typed generation with dry-run prompt previews.
 - Batch seed-file processing for typed generation.
-- Huge-pattern `.hcmask` export for shapes like `Kista` + 9 digits + 2 symbols.
->>>>>>> 5c77e57 (Add typed wordlist generation with AI dry-run and batch support)
 - Hashcat-style mask generation, `.hcmask` templates, and small rule exports.
 - Scriptable command-line mode for repeatable workflows.
 
