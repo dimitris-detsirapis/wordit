@@ -1,5 +1,7 @@
 # w0rd!t
 
+Current version: **1.2.0**
+
 w0rd!t is a friendly Python wordlist builder for authorized password recovery,
 password auditing, CTFs, and training labs. It turns real hints into useful,
 bounded candidate lists and exports masks for huge search spaces that should not
@@ -17,9 +19,18 @@ assess.
 - Hint/profile-based wordlist generation.
 - Manual word entry and wordlist import.
 - Focused mutation styles: numbers, symbols, capitals, mixed, quick, and wide.
+- Tool-ready typed generators for password bases, subdomains, web paths, and
+  cloud resource names.
+- Per-type validation so generated candidates match their target tools.
 - URL and file harvesting with GitHub profile support.
 - Optional bounded recursive harvest with AI keyword enrichment.
+<<<<<<< HEAD
 - Huge-pattern `.hcmask` export for shapes like `Tester` + 9 digits + 2 symbols.
+=======
+- Optional AI typed generation with dry-run prompt previews.
+- Batch seed-file processing for typed generation.
+- Huge-pattern `.hcmask` export for shapes like `Kista` + 9 digits + 2 symbols.
+>>>>>>> 5c77e57 (Add typed wordlist generation with AI dry-run and batch support)
 - Hashcat-style mask generation, `.hcmask` templates, and small rule exports.
 - Scriptable command-line mode for repeatable workflows.
 
@@ -58,6 +69,27 @@ Create a focused list from hints:
 
 ```bash
 python3 wordit.py --profile "alice, acme, phoenix, 2026" --mutate focused -o words.txt
+```
+
+Generate tool-ready typed lists:
+
+```bash
+python3 wordit.py --type password-base --add "alice acme phoenix" -o password_base.txt
+python3 wordit.py --type subdomain --add "acme payments aws" -o subdomains.txt
+python3 wordit.py --type directory --add "wordpress acme php apache" -o paths.txt
+python3 wordit.py --type cloud-resource --add "acme aws payments prod" -o cloud.txt
+```
+
+Preview an AI generation prompt without spending an API call:
+
+```bash
+python3 wordit.py --type subdomain --add "acme fintech aws" --ai-generate --dry-run --max-candidates 50
+```
+
+Generate typed candidates from a seed file:
+
+```bash
+python3 wordit.py --type subdomain --batch-file seeds.txt --batch-size 5 --max-candidates 500 -o batch_subdomains.txt
 ```
 
 Import an existing list and add number-based mutations:
@@ -103,6 +135,26 @@ Use these from the menu or with `--mutate STYLE`:
 - `quick`: smaller and faster.
 - `wide`: larger search space.
 
+## Typed Wordlists
+
+Use `--type TYPE` from the command line or `typegen` inside the interactive
+shell. Supported types:
+
+- `password-base`: alphanumeric base words for Hashcat rules and hybrid attacks.
+- `subdomain`: lowercase DNS labels for tools like Gobuster and ffuf.
+- `directory`: relative URL paths/files for ffuf, wfuzz, Gobuster, and similar tools.
+- `cloud-resource`: realistic bucket/storage/resource-name candidates.
+
+Typed generation can run locally with no dependencies, or with AI:
+
+```bash
+python3 wordit.py --type cloud-resource --add "acme aws backup data" --ai-generate -o cloud.txt
+```
+
+Use `--dry-run` with `--ai-generate` to inspect the exact prompt before any API
+call. Use `--batch-file` when each line contains a target, product, project, or
+seed set that should be processed in batches.
+
 ## Huge Patterns
 
 Some likely passwords are too large to write as text. For example:
@@ -130,11 +182,17 @@ HTML. If you enter `github.com/user` without `https://`, w0rd!t normalizes it.
 If a URL cannot be fetched but contains useful path text, w0rd!t still adds
 best-effort URL tokens such as names split from hyphenated profile paths.
 
-## AI Smart Harvest
+## AI Features
 
 `Advanced options` -> `AI smart harvest` can crawl a small authorized scope and
 optionally ask OpenAI or Gemini to extract better seed words from the harvested
 text.
+
+Typed AI generation uses the same API setup:
+
+```bash
+python3 wordit.py --type directory --add "django acme nginx" --ai-generate --ai-provider openai -o ai_paths.txt
+```
 
 Use `Advanced options` -> `AI API setup` to enter an API key from the menu. Keys
 are hidden while typing in a real terminal. They are session-only by default. If

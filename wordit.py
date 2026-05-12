@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - Unix shells normally provide this.
 
 
 APP_NAME = "w0rd!t"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CREATOR_NAME = "Dimitris Detsirapis"
 DEFAULT_MAX_CANDIDATES = 100_000
 DEFAULT_MIN_LEN = 4
@@ -105,6 +105,23 @@ STYLE_ALIASES = {
 }
 
 MUTATION_STYLES = ("focused", "numbers", "symbols", "both", "caps", "quick", "wide")
+TARGET_WORDLIST_TYPES = ("password-base", "subdomain", "directory", "cloud-resource")
+TARGET_WORDLIST_ALIASES = {
+    "cloud": "cloud-resource",
+    "cloud_resource": "cloud-resource",
+    "cloudresource": "cloud-resource",
+    "dir": "directory",
+    "dirs": "directory",
+    "file": "directory",
+    "files": "directory",
+    "path": "directory",
+    "paths": "directory",
+    "password": "password-base",
+    "passwords": "password-base",
+    "sub": "subdomain",
+    "subs": "subdomain",
+    "dns": "subdomain",
+}
 WORDLIST_SIZE_CAPS = {
     "small": 25_000,
     "medium": 100_000,
@@ -143,6 +160,87 @@ BUILTIN_MASK_CHARSETS["a"] = (
     + BUILTIN_MASK_CHARSETS["u"]
     + BUILTIN_MASK_CHARSETS["d"]
     + BUILTIN_MASK_CHARSETS["s"]
+)
+
+INFRA_WORDS = (
+    "api",
+    "app",
+    "admin",
+    "auth",
+    "cdn",
+    "dev",
+    "demo",
+    "edge",
+    "internal",
+    "legacy",
+    "mail",
+    "mgmt",
+    "mobile",
+    "portal",
+    "prod",
+    "qa",
+    "stage",
+    "staging",
+    "status",
+    "test",
+    "uat",
+    "vpn",
+    "www",
+)
+ENVIRONMENT_WORDS = ("dev", "test", "stage", "staging", "uat", "qa", "prod", "demo", "old", "new", "legacy")
+DIRECTORY_BASE_PATHS = (
+    "admin",
+    "api",
+    "api/v1",
+    "api/v2",
+    "assets",
+    "backup",
+    "backups",
+    "config",
+    "debug",
+    "docs",
+    "download",
+    "files",
+    ".env",
+    ".env.local",
+    ".env.prod",
+    ".git/HEAD",
+    ".git/config",
+    "graphql",
+    "health",
+    "logs",
+    "old",
+    "portal",
+    "private",
+    "public",
+    "static",
+    "status",
+    "test",
+    "tmp",
+    "upload",
+    "uploads",
+)
+DIRECTORY_EXTENSIONS = ("bak", "old", "zip", "tar.gz", "sql", "log", "txt", "json", "yml", "conf", "php")
+CLOUD_RESOURCE_WORDS = (
+    "assets",
+    "archive",
+    "backup",
+    "builds",
+    "cache",
+    "data",
+    "exports",
+    "files",
+    "images",
+    "internal",
+    "logs",
+    "prod",
+    "public",
+    "reports",
+    "shared",
+    "state",
+    "staging",
+    "test",
+    "uploads",
 )
 
 
@@ -793,6 +891,527 @@ def extract_words(
     return ordered_unique(words)
 
 
+def normalize_target_wordlist_type(name: str) -> str:
+    normalized = (name or "").strip().lower().replace("_", "-")
+    normalized = TARGET_WORDLIST_ALIASES.get(normalized, normalized)
+    if normalized not in TARGET_WORDLIST_TYPES:
+        raise ValueError(f"Choose one of: {', '.join(TARGET_WORDLIST_TYPES)}.")
+    return normalized
+
+
+def seed_words_from_values(values: Iterable[str], preserve_unicode: bool = False) -> list[str]:
+    seeds: list[str] = []
+    for raw in values:
+        raw_tokens = extract_words(
+            str(raw),
+            min_len=1,
+            max_len=64,
+            lowercase=True,
+            preserve_unicode=preserve_unicode,
+        )
+        if len(raw_tokens) > 1:
+            seeds.extend(raw_tokens)
+            seeds.append("".join(raw_tokens))
+            acronym = "".join(token[0] for token in raw_tokens if token)
+            if acronym:
+                seeds.append(acronym)
+        for item in parse_human_list(str(raw)):
+            tokens = extract_words(
+                item,
+                min_len=1,
+                max_len=64,
+                lowercase=True,
+                preserve_unicode=preserve_unicode,
+            )
+            if len(tokens) > 1:
+                seeds.append("".join(tokens))
+                acronym = "".join(token[0] for token in tokens if token)
+                if acronym:
+                    seeds.append(acronym)
+            seeds.extend(tokens)
+    return ordered_unique(seeds)
+
+
+def _lower_ascii(value: str) -> str:
+    return ascii_fold(value).lower()
+
+
+def _alnum_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _lower_ascii(value))
+
+
+def _hyphen_slug(value: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", _lower_ascii(value))).strip("-")
+
+
+def _underscore_slug(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", _lower_ascii(value))).strip("_")
+
+
+def validate_typed_candidate(kind: str, value: str, preserve_unicode: bool = False) -> bool:
+    kind = normalize_target_wordlist_type(kind)
+    candidate = str(value)
+    candidate = unicodedata.normalize("NFKC", candidate) if preserve_unicode else ascii_fold(candidate)
+    candidate = candidate.strip()
+    strip_chars = ",;:'\"`[]{}()" if kind == "directory" else ".,;:'\"`[]{}()"
+    candidate = candidate.strip(strip_chars)
+    if kind in {"subdomain", "cloud-resource"}:
+        candidate = _lower_ascii(candidate)
+    elif kind == "password-base" and not preserve_unicode:
+        candidate = ascii_fold(candidate)
+    if not candidate:
+        return False
+    if kind == "password-base":
+        return 3 <= len(candidate) <= 30 and bool(re.fullmatch(r"[A-Za-z0-9]+", candidate))
+    if kind == "subdomain":
+        if not 1 <= len(candidate) <= 63 or "--" in candidate:
+            return False
+        return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", candidate))
+    if kind == "directory":
+        if not 1 <= len(candidate) <= 255:
+            return False
+        if candidate == ".":
+            return False
+        if candidate.startswith(("/", "\\")) or candidate.endswith(("/", "\\")):
+            return False
+        if ".." in candidate or "//" in candidate or "\\" in candidate:
+            return False
+        if "://" in candidate or "?" in candidate or "#" in candidate:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9\-_.~/]+", candidate))
+    if kind == "cloud-resource":
+        if not 3 <= len(candidate) <= 63:
+            return False
+        if any(bad in candidate for bad in ("--", "__", "-_", "_-")):
+            return False
+        return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?", candidate))
+    return False
+
+
+def clean_typed_candidate(kind: str, value: str, preserve_unicode: bool = False) -> str:
+    kind = normalize_target_wordlist_type(kind)
+    candidate = clean_candidate(value, preserve_unicode=preserve_unicode)
+    strip_chars = ",;:'\"`[]{}()" if kind == "directory" else ".,;:'\"`[]{}()"
+    candidate = candidate.strip(strip_chars)
+    if kind in {"subdomain", "cloud-resource"}:
+        candidate = _lower_ascii(candidate)
+    if kind == "subdomain":
+        candidate = _hyphen_slug(candidate)
+    elif kind == "cloud-resource":
+        candidate = re.sub(r"[^a-z0-9_-]+", "-", _lower_ascii(candidate)).strip("-_")
+    elif kind == "password-base" and not preserve_unicode:
+        candidate = ascii_fold(candidate)
+    return candidate
+
+
+def process_typed_candidates(
+    kind: str,
+    candidates: Iterable[str],
+    limit: int = DEFAULT_MAX_CANDIDATES,
+    preserve_unicode: bool = False,
+) -> list[str]:
+    kind = normalize_target_wordlist_type(kind)
+    cleaned: list[str] = []
+    for raw in candidates:
+        candidate = clean_typed_candidate(kind, raw, preserve_unicode=preserve_unicode)
+        if validate_typed_candidate(kind, candidate, preserve_unicode=preserve_unicode):
+            cleaned.append(candidate)
+        if len(cleaned) >= limit * 3:
+            break
+    return ordered_unique(cleaned)[:limit]
+
+
+def _password_base_stream(seeds: Sequence[str]) -> Iterator[str]:
+    bases = [_alnum_slug(seed) for seed in seeds]
+    bases = [base for base in ordered_unique(bases) if base]
+    for base in bases:
+        yield base
+        yield base.capitalize()
+        yield base.upper()
+        if base.endswith("s") and len(base) > 4:
+            yield base[:-1]
+        elif len(base) > 3:
+            yield base + "s"
+        if len(base) > 5:
+            yield base[:4]
+            yield base[:6]
+    for left, right in itertools.permutations(bases[:16], 2):
+        yield left + right
+        if len(left) <= 8 and len(right) <= 8:
+            yield left.capitalize() + right.capitalize()
+
+
+def _subdomain_stream(seeds: Sequence[str]) -> Iterator[str]:
+    bases = [_hyphen_slug(seed) for seed in seeds]
+    bases = [base for base in ordered_unique(bases) if base]
+    for base in bases:
+        yield base
+        for word in INFRA_WORDS:
+            yield f"{base}-{word}"
+            yield f"{word}-{base}"
+        for env in ENVIRONMENT_WORDS:
+            yield f"{base}-{env}"
+            yield f"{env}-{base}"
+        if len(base) <= 20:
+            yield f"{base}api"
+            yield f"{base}app"
+    for left, right in itertools.permutations(bases[:12], 2):
+        yield f"{left}-{right}"
+        if len(left + right) <= 63:
+            yield left + right
+    for word in INFRA_WORDS:
+        yield word
+    for service in ("api", "app", "admin", "portal", "auth", "cdn", "vpn", "mail"):
+        for env in ENVIRONMENT_WORDS[:8]:
+            yield f"{service}-{env}"
+            yield f"{env}-{service}"
+
+
+def _directory_stream(seeds: Sequence[str]) -> Iterator[str]:
+    bases = [_hyphen_slug(seed) for seed in seeds]
+    bases = [base for base in ordered_unique(bases) if base]
+    yield from DIRECTORY_BASE_PATHS
+    for base in bases:
+        yield base
+        for ext in DIRECTORY_EXTENSIONS:
+            yield f"{base}.{ext}"
+        for env in ENVIRONMENT_WORDS:
+            yield f"{base}-{env}"
+            yield f"{base}_{env}"
+            yield f"{env}-{base}"
+            yield f"{env}_{base}"
+        for folder in ("admin", "api", "assets", "backup", "backups", "config", "docs", "files", "logs", "static", "uploads"):
+            yield f"{folder}/{base}"
+            yield f"{base}/{folder}"
+        yield f"api/{base}"
+        yield f"api/v1/{base}"
+        yield f"api/v2/{base}"
+        yield f"uploads/{base}.zip"
+        yield f"backups/{base}.tar.gz"
+        yield f"config/{base}.yml"
+        yield f"logs/{base}.log"
+    for left, right in itertools.permutations(bases[:8], 2):
+        yield f"{left}-{right}"
+        yield f"{left}_{right}"
+        yield f"{left}/{right}"
+
+
+def _cloud_resource_stream(seeds: Sequence[str]) -> Iterator[str]:
+    bases = [_hyphen_slug(seed) for seed in seeds]
+    bases.extend(_underscore_slug(seed) for seed in seeds)
+    bases = [base for base in ordered_unique(bases) if base]
+    for base in bases:
+        yield base
+        for word in CLOUD_RESOURCE_WORDS:
+            yield f"{base}-{word}"
+            yield f"{word}-{base}"
+        for env in ENVIRONMENT_WORDS:
+            yield f"{base}-{env}"
+            yield f"{env}-{base}"
+        for word in ("data", "backup", "logs", "assets", "uploads", "archive"):
+            for env in ("dev", "test", "prod", "stage"):
+                yield f"{base}-{word}-{env}"
+                yield f"{base}-{env}-{word}"
+        yield f"{base}-tf-state"
+        yield f"{base}-terraform-state"
+        yield f"{base}-jenkins-artifacts"
+        yield f"{base}-vendor-uploads"
+    for left, right in itertools.permutations(bases[:10], 2):
+        yield f"{left}-{right}"
+        yield f"{left}-{right}-prod"
+        yield f"{left}-{right}-backup"
+
+
+def generate_typed_wordlist(
+    kind: str,
+    seeds: Sequence[str],
+    limit: int = DEFAULT_MAX_CANDIDATES,
+    preserve_unicode: bool = False,
+) -> list[str]:
+    kind = normalize_target_wordlist_type(kind)
+    seed_words = seed_words_from_values(seeds, preserve_unicode=preserve_unicode)
+    if not seed_words:
+        return []
+    if kind == "password-base":
+        stream = _password_base_stream(seed_words)
+    elif kind == "subdomain":
+        stream = _subdomain_stream(seed_words)
+    elif kind == "directory":
+        stream = _directory_stream(seed_words)
+    else:
+        stream = _cloud_resource_stream(seed_words)
+    return process_typed_candidates(kind, stream, limit=limit, preserve_unicode=preserve_unicode)
+
+
+def typed_wordlist_seed_hints(kind: str) -> str:
+    kind = normalize_target_wordlist_type(kind)
+    if kind == "password-base":
+        return "names, handles, pets, teams, cities, projects, products, hobbies, and memorable terms"
+    if kind == "subdomain":
+        return "company names, abbreviations, products, departments, locations, cloud providers, and technologies"
+    if kind == "directory":
+        return "frameworks, languages, server software, app purpose, product names, and known paths"
+    return "company names, stock tickers, products, teams, projects, cloud provider, regions, and internal terms"
+
+
+def typed_wordlist_usage(kind: str, output_name: str = "wordlist.txt") -> str:
+    kind = normalize_target_wordlist_type(kind)
+    if kind == "password-base":
+        return f"Use with hashcat rules, for example: hashcat -a 0 -m <hash_type> hashes.txt {output_name} -r rules/best64.rule"
+    if kind == "subdomain":
+        return f"Use with DNS enumeration, for example: gobuster dns -d target.com -w {output_name}"
+    if kind == "directory":
+        return f"Use with web fuzzing, for example: ffuf -u https://target.com/FUZZ -w {output_name}"
+    return f"Use with cloud enumeration tools, for example: cloud_enum -k {output_name} or provider-specific bucket checks"
+
+
+def ai_wordlist_prompt(kind: str, seeds: Sequence[str], max_words: int, instructions: str = "") -> str:
+    kind = normalize_target_wordlist_type(kind)
+    seed_text = ", ".join(seed_words_from_values(seeds) or [str(seed) for seed in seeds])
+    usage_focus = {
+        "password-base": (
+            "Generate clean alphanumeric base words for password auditing. "
+            "Hashcat or w0rd!t will handle numbers, symbols, case, and leetspeak later."
+        ),
+        "subdomain": (
+            "Generate DNS label candidates for subdomain enumeration. Include realistic "
+            "service, environment, regional, legacy, and shadow-IT names."
+        ),
+        "directory": (
+            "Generate URL path candidates for web directory/file fuzzing. Include "
+            "framework paths, backups, configs, logs, API routes, and developer artifacts."
+        ),
+        "cloud-resource": (
+            "Generate realistic cloud resource names. Include buckets/storage accounts, "
+            "logs, backups, data exports, Terraform state, migration artifacts, and team names."
+        ),
+    }[kind]
+    validation = {
+        "password-base": "Only A-Z, a-z, and digits. Length 3-30. No spaces or symbols.",
+        "subdomain": "Lowercase DNS labels only. Use a-z, 0-9, and hyphens. No leading/trailing hyphens. Max 63 chars.",
+        "directory": "Relative paths only. No leading slash, full URLs, query strings, fragments, or path traversal. URL-safe path chars only.",
+        "cloud-resource": "Lowercase names only. Use a-z, 0-9, hyphens, or underscores. Length 3-63. No leading/trailing separators.",
+    }[kind]
+    extra = f"\nAdditional operator instructions: {instructions.strip()}" if instructions.strip() else ""
+    return textwrap.dedent(
+        f"""
+        You are helping with authorized security testing and training.
+
+        Task: create a {kind} wordlist from the provided context.
+        Context seeds: {seed_text}
+        Target count: {max_words}
+
+        Focus:
+        {usage_focus}
+
+        Output rules:
+        - Return exactly {max_words} candidates if possible.
+        - One candidate per line.
+        - No markdown, numbering, categories, explanations, or comments.
+        - No duplicates.
+        - {validation}
+        - Prefer candidates connected to the provided context; avoid generic filler.
+        - Include a mix of obvious, realistic, legacy, temporary, and developer-shortcut patterns.{extra}
+        """
+    ).strip()
+
+
+def parse_ai_wordlist_candidates(payload: str) -> list[str]:
+    payload = payload.strip()
+    if not payload:
+        return []
+    try:
+        decoded = json.loads(payload)
+        values: object
+        if isinstance(decoded, dict):
+            values = (
+                decoded.get("candidates")
+                or decoded.get("words")
+                or decoded.get("wordlist")
+                or decoded.get("items")
+                or decoded.get("keywords")
+                or []
+            )
+        else:
+            values = decoded
+        if isinstance(values, list):
+            return [str(item).strip() for item in values if str(item).strip()]
+    except json.JSONDecodeError:
+        pass
+
+    candidates: list[str] = []
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^(?:[-*]|\d+[.)])\s*", "", line)
+        line = line.strip("`'\" ")
+        if not line or ":" in line:
+            continue
+        candidates.append(line)
+    return candidates
+
+
+def select_default_ai_provider() -> str:
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
+    return "openai"
+
+
+def ai_generate_wordlist(
+    provider: str,
+    kind: str,
+    seeds: Sequence[str],
+    max_words: int = 100,
+    model: str = "",
+    instructions: str = "",
+    preserve_unicode: bool = False,
+) -> list[str]:
+    provider = provider.strip().lower()
+    kind = normalize_target_wordlist_type(kind)
+    prompt = ai_wordlist_prompt(kind, seeds, max_words, instructions=instructions)
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is not set.")
+        selected_model = model or os.environ.get("W0RDIT_OPENAI_MODEL", "gpt-4.1-mini")
+        body = {
+            "model": selected_model,
+            "input": prompt,
+            "instructions": "Return plain text only, one candidate per line. No markdown.",
+        }
+        request = Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            raise ValueError(f"OpenAI API error HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise ValueError(f"OpenAI API connection failed: {exc.reason}") from exc
+        raw_candidates = parse_ai_wordlist_candidates(extract_openai_response_text(data))
+        return process_typed_candidates(kind, raw_candidates, limit=max_words, preserve_unicode=preserve_unicode)
+
+    if provider == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is not set.")
+        selected_model = model or os.environ.get("W0RDIT_GEMINI_MODEL", "gemini-2.5-flash")
+        body = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                    ],
+                }
+            ]
+        }
+        request = Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:300]
+            raise ValueError(f"Gemini API error HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise ValueError(f"Gemini API connection failed: {exc.reason}") from exc
+        parts: list[str] = []
+        candidates = data.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                content = candidate.get("content")
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts", []):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+        raw_candidates = parse_ai_wordlist_candidates("\n".join(parts))
+        return process_typed_candidates(kind, raw_candidates, limit=max_words, preserve_unicode=preserve_unicode)
+
+    raise ValueError("Choose provider openai or gemini.")
+
+
+def read_batch_seed_groups(path: str | Path, preserve_unicode: bool = False) -> list[list[str]]:
+    seed_groups: list[list[str]] = []
+    for line in Path(path).expanduser().read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        seeds = seed_words_from_values([line], preserve_unicode=preserve_unicode)
+        if seeds:
+            seed_groups.append(seeds)
+    return seed_groups
+
+
+def generate_batch_typed_wordlist(
+    kind: str,
+    seed_groups: Sequence[Sequence[str]],
+    batch_size: int = 5,
+    limit: int = DEFAULT_MAX_CANDIDATES,
+    base_context: Sequence[str] = (),
+    preserve_unicode: bool = False,
+    ai_provider: str = "",
+    ai_model: str = "",
+    ai_instructions: str = "",
+) -> list[str]:
+    kind = normalize_target_wordlist_type(kind)
+    if batch_size < 1:
+        raise ValueError("Batch size must be 1 or higher.")
+    chunks = [
+        seed_groups[index : index + batch_size]
+        for index in range(0, len(seed_groups), batch_size)
+    ]
+    if not chunks:
+        return []
+    per_batch_limit = max(1, min(limit, (limit + len(chunks) - 1) // len(chunks)))
+    candidates: list[str] = []
+    base = list(base_context)
+    for chunk in chunks:
+        seeds = ordered_unique([*base, *(seed for group in chunk for seed in group)])
+        if ai_provider:
+            generated = ai_generate_wordlist(
+                ai_provider,
+                kind,
+                seeds,
+                max_words=per_batch_limit,
+                model=ai_model,
+                instructions=ai_instructions,
+                preserve_unicode=preserve_unicode,
+            )
+        else:
+            generated = generate_typed_wordlist(
+                kind,
+                seeds,
+                limit=per_batch_limit,
+                preserve_unicode=preserve_unicode,
+            )
+        candidates.extend(generated)
+        candidates = process_typed_candidates(kind, candidates, limit=limit, preserve_unicode=preserve_unicode)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
 def parse_date_fragments(values: Iterable[str]) -> list[str]:
     fragments: list[str] = []
     for value in values:
@@ -1378,6 +1997,7 @@ class WorditShell(cmd.Cmd):
         lines = [color("Advanced options", "bold", "magenta")]
         lines.extend(f"  {color(f'[{key}]', 'yellow')} {label}" for key, label in items)
         lines.append(color("Tip: 0 goes back. Type menu for main, advanced for this screen.", "dim"))
+        lines.append(color("     Type typegen for password-base, subdomain, directory, or cloud-resource lists.", "dim"))
         return "\n".join(lines)
 
     def do_help(self, arg: str) -> None:
@@ -1399,7 +2019,7 @@ class WorditShell(cmd.Cmd):
                   exit                 Quit
 
                 Mutation styles: focused, numbers, symbols, both, caps, quick, wide.
-                Advanced commands: harvest, huge, aiharvest, aisetup, mask, passphrase, rules, hcmask.
+                Advanced commands: harvest, huge, aiharvest, typegen, typebatch, aisetup, mask, passphrase, rules, hcmask.
 
                 Mask tokens: ?l lower, ?u upper, ?d digit, ?s symbol, ?a all,
                 ?h lowercase hex, ?H uppercase hex, ?1-?4 custom charsets.
@@ -1423,6 +2043,9 @@ class WorditShell(cmd.Cmd):
         return path_completions(text)
 
     def complete_hcmask(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return path_completions(text)
+
+    def complete_typebatch(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
         return path_completions(text)
 
     def do_menu(self, arg: str) -> None:
@@ -1800,6 +2423,142 @@ class WorditShell(cmd.Cmd):
     def do_ai(self, arg: str) -> None:
         self.do_aiharvest(arg)
 
+    def print_target_wordlist_types(self) -> None:
+        print(color("Typed wordlists", "bold", "magenta"))
+        print("  password-base   clean base words for hashcat/rules")
+        print("  subdomain       DNS labels for gobuster, ffuf, and similar tools")
+        print("  directory       relative paths for web directory/file fuzzing")
+        print("  cloud-resource  bucket/storage/resource-name candidates")
+
+    def ask_target_wordlist_type(self, default: str = "password-base") -> str:
+        self.print_target_wordlist_types()
+        while True:
+            raw = self.ask("Type", default)
+            try:
+                return normalize_target_wordlist_type(raw)
+            except ValueError as exc:
+                print(exc)
+
+    def typed_seeds_from_prompt(self, raw_values: Sequence[str]) -> list[str]:
+        if raw_values:
+            return seed_words_from_values(raw_values, preserve_unicode=self.bank.preserve_unicode)
+        if self.bank and self.ask_bool("Use current session words as context", True):
+            return self.bank.words()
+        raw = self.ask("Seed words")
+        return seed_words_from_values([raw], preserve_unicode=self.bank.preserve_unicode)
+
+    def do_typegen(self, arg: str) -> None:
+        print(color("Generate typed wordlist", "bold", "magenta"))
+        print("Builds tool-ready candidates and validates them before adding them to this session.")
+        raw_parts = parse_human_list(arg)
+        kind = ""
+        seed_parts = raw_parts
+        if raw_parts:
+            try:
+                kind = normalize_target_wordlist_type(raw_parts[0])
+                seed_parts = raw_parts[1:]
+            except ValueError:
+                kind = ""
+        if not kind:
+            kind = self.ask_target_wordlist_type("password-base")
+        print(f"Seed hints: {typed_wordlist_seed_hints(kind)}")
+        seeds = self.typed_seeds_from_prompt(seed_parts)
+        if not seeds:
+            print("No seed words found.")
+            return
+        limit = self.ask_int("Target candidates", min(250, self.default_max_candidates), minimum=1)
+        use_ai = self.ask_bool("Use AI generation", False)
+        if use_ai:
+            dry_run = self.ask_bool("Dry run / preview prompt only", False)
+            instructions = self.ask("Extra AI instructions (blank skips)")
+            if dry_run:
+                print(ai_wordlist_prompt(kind, seeds, limit, instructions=instructions))
+                return
+            load_ai_config()
+            provider = self.ask_choice("AI provider", ("openai", "gemini"), select_default_ai_provider())
+            model = self.ask("Model override (blank = provider default)")
+            try:
+                candidates = ai_generate_wordlist(
+                    provider,
+                    kind,
+                    seeds,
+                    max_words=limit,
+                    model=model,
+                    instructions=instructions,
+                    preserve_unicode=self.bank.preserve_unicode,
+                )
+            except ValueError as exc:
+                print(f"AI generation failed: {exc}")
+                print("Run AI API setup from Advanced options if you need to configure a key.")
+                return
+            source = f"ai-generate:{kind}"
+        else:
+            candidates = generate_typed_wordlist(
+                kind,
+                seeds,
+                limit=limit,
+                preserve_unicode=self.bank.preserve_unicode,
+            )
+            source = f"type:{kind}"
+        if not candidates:
+            print("No valid typed candidates were generated.")
+            return
+        added = self.bank.add_many(candidates, source=source, preserve_unicode=self.bank.preserve_unicode)
+        self.report_added(added)
+        print(typed_wordlist_usage(kind))
+
+    def do_typed(self, arg: str) -> None:
+        self.do_typegen(arg)
+
+    def do_typebatch(self, arg: str) -> None:
+        print(color("Typed batch generation", "bold", "magenta"))
+        path = arg.strip() or self.ask_path("Batch seed file")
+        if Path(path).expanduser().is_dir():
+            print("That path is a directory. Press Tab after the trailing slash to choose a file inside it.")
+            return
+        kind = self.ask_target_wordlist_type("subdomain")
+        batch_size = self.ask_int("Seed lines per batch", 5, minimum=1)
+        limit = self.ask_int("Total candidate cap", min(1000, self.default_max_candidates), minimum=1)
+        use_ai = self.ask_bool("Use AI generation", False)
+        try:
+            seed_groups = read_batch_seed_groups(path, preserve_unicode=self.bank.preserve_unicode)
+        except OSError as exc:
+            print(f"Could not read batch file: {exc}")
+            return
+        if not seed_groups:
+            print("No seed groups found.")
+            return
+        ai_provider = ""
+        ai_model = ""
+        ai_instructions = ""
+        if use_ai:
+            if self.ask_bool("Dry run / preview first batch prompt only", False):
+                first = ordered_unique([*(seed for group in seed_groups[:batch_size] for seed in group)])
+                print(ai_wordlist_prompt(kind, first, max(1, limit // max(1, len(seed_groups))), instructions=""))
+                return
+            load_ai_config()
+            ai_provider = self.ask_choice("AI provider", ("openai", "gemini"), select_default_ai_provider())
+            ai_model = self.ask("Model override (blank = provider default)")
+            ai_instructions = self.ask("Extra AI instructions (blank skips)")
+        try:
+            candidates = generate_batch_typed_wordlist(
+                kind,
+                seed_groups,
+                batch_size=batch_size,
+                limit=limit,
+                base_context=self.bank.words(),
+                preserve_unicode=self.bank.preserve_unicode,
+                ai_provider=ai_provider,
+                ai_model=ai_model,
+                ai_instructions=ai_instructions,
+            )
+        except ValueError as exc:
+            print(f"Batch generation failed: {exc}")
+            return
+        added = self.bank.add_many(candidates, source=f"typebatch:{kind}", preserve_unicode=self.bank.preserve_unicode)
+        self.report_added(added)
+        print(typed_wordlist_usage(kind))
+
     def do_aisetup(self, arg: str) -> None:
         print(color("AI API setup", "bold", "magenta"))
         print(f"OpenAI key: {mask_secret(os.environ.get('OPENAI_API_KEY', ''))}")
@@ -2088,6 +2847,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harvest-url", action="append", default=[], help="Extract words from a single in-scope URL.")
     parser.add_argument("--profile", help="Comma-separated hint words for focused generation.")
     parser.add_argument(
+        "--type",
+        dest="wordlist_type",
+        help="Generate a tool-ready typed list: password-base, subdomain, directory, or cloud-resource.",
+    )
+    parser.add_argument(
+        "--ai-generate",
+        action="store_true",
+        help="Use OpenAI or Gemini to generate the typed list. Requires --type.",
+    )
+    parser.add_argument("--ai-provider", choices=("openai", "gemini"), help="AI provider for --ai-generate.")
+    parser.add_argument("--ai-model", help="Model override for --ai-generate.")
+    parser.add_argument("--ai-instructions", help="Extra instructions for typed AI generation.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview a typed generation plan or AI prompt without writing candidates.",
+    )
+    parser.add_argument("--batch-file", help="Read seed groups from a file for typed batch generation.")
+    parser.add_argument("--batch-size", type=int, default=5, help="Seed lines per typed batch.")
+    parser.add_argument(
         "--mutate",
         choices=("focused", "numbers", "symbols", "both", "caps", "quick", "balanced", "wide"),
         help="Mutate loaded words with a named style.",
@@ -2115,6 +2894,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def run_noninteractive(args: argparse.Namespace) -> int:
     bank = WordBank(preserve_unicode=args.preserve_unicode)
+    context_words: list[str] = []
     options = replace(
         option_preset(args.mutate or "focused", args.max_candidates),
         min_len=args.min_len,
@@ -2122,6 +2902,10 @@ def run_noninteractive(args: argparse.Namespace) -> int:
         max_candidates=args.max_candidates,
         preserve_unicode=args.preserve_unicode,
     )
+    if (args.ai_generate or args.batch_file or args.dry_run) and not args.wordlist_type:
+        raise SystemExit("--ai-generate, --batch-file, and --dry-run are used with --type.")
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be 1 or higher.")
 
     for raw in args.add:
         words: list[str] = []
@@ -2136,21 +2920,26 @@ def run_noninteractive(args: argparse.Namespace) -> int:
                 )
                 or [item]
             )
+        context_words.extend(words)
         bank.add_many(words, source="manual")
     for path in args.import_file:
+        imported_words = read_word_file(path, preserve_unicode=args.preserve_unicode)
+        context_words.extend(imported_words)
         bank.add_many(
-            read_word_file(path, preserve_unicode=args.preserve_unicode),
+            imported_words,
             source=f"import:{Path(path).name}",
         )
     for path in args.harvest_file:
         text = Path(path).expanduser().read_text(encoding="utf-8", errors="ignore")
+        harvested_words = extract_words(
+            text,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            preserve_unicode=args.preserve_unicode,
+        )
+        context_words.extend(harvested_words)
         bank.add_many(
-            extract_words(
-                text,
-                min_len=args.min_len,
-                max_len=args.max_len,
-                preserve_unicode=args.preserve_unicode,
-            ),
+            harvested_words,
             source="harvest:file",
         )
     for url in args.harvest_url:
@@ -2160,17 +2949,21 @@ def run_noninteractive(args: argparse.Namespace) -> int:
             harvested = harvest_url(url)
         except ValueError as exc:
             raise SystemExit(f"Harvest failed: {exc}") from exc
+        harvested_words = extract_words(
+            harvested,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            preserve_unicode=args.preserve_unicode,
+        )
+        context_words.extend(harvested_words)
         bank.add_many(
-            extract_words(
-                harvested,
-                min_len=args.min_len,
-                max_len=args.max_len,
-                preserve_unicode=args.preserve_unicode,
-            ),
+            harvested_words,
             source="harvest:url",
         )
     if args.profile:
         profile = {"extras": args.profile, "dates": args.profile}
+        tokens, dates = profile_tokens(profile, preserve_unicode=args.preserve_unicode)
+        context_words.extend([*tokens, *dates])
         bank.add_many(build_profile_wordlist(profile, options), source="profile")
     if args.mask:
         custom = {
@@ -2187,6 +2980,104 @@ def run_noninteractive(args: argparse.Namespace) -> int:
         if count > args.max_candidates:
             print(f"Mask keyspace is {format_count(count)}; generating first {format_count(args.max_candidates)}.")
         bank.add_many(generate_from_mask(args.mask, custom, limit=args.max_candidates), source="mask")
+    if args.wordlist_type:
+        try:
+            wordlist_type = normalize_target_wordlist_type(args.wordlist_type)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if args.ai_generate and not args.dry_run:
+            load_ai_config()
+        ai_provider = args.ai_provider or select_default_ai_provider()
+        base_context = ordered_unique(context_words or bank.words())
+        try:
+            if args.batch_file:
+                seed_groups = read_batch_seed_groups(
+                    args.batch_file,
+                    preserve_unicode=args.preserve_unicode,
+                )
+                if not seed_groups:
+                    raise SystemExit("Batch file did not contain any seed words.")
+                first_batch_seeds = ordered_unique(
+                    [
+                        *base_context,
+                        *(seed for group in seed_groups[: args.batch_size] for seed in group),
+                    ]
+                )
+                if args.dry_run:
+                    print(f"Typed batch plan: {wordlist_type}, {len(seed_groups)} seed group(s), batch size {args.batch_size}.")
+                    if args.ai_generate:
+                        print(ai_wordlist_prompt(
+                            wordlist_type,
+                            first_batch_seeds,
+                            max(1, min(args.max_candidates, args.max_candidates // max(1, len(seed_groups)) or 1)),
+                            instructions=args.ai_instructions or "",
+                        ))
+                    else:
+                        preview = generate_typed_wordlist(
+                            wordlist_type,
+                            first_batch_seeds,
+                            limit=min(20, args.max_candidates),
+                            preserve_unicode=args.preserve_unicode,
+                        )
+                        print("\n".join(preview))
+                    return 0
+                candidates = generate_batch_typed_wordlist(
+                    wordlist_type,
+                    seed_groups,
+                    batch_size=args.batch_size,
+                    limit=args.max_candidates,
+                    base_context=base_context,
+                    preserve_unicode=args.preserve_unicode,
+                    ai_provider=ai_provider if args.ai_generate else "",
+                    ai_model=args.ai_model or "",
+                    ai_instructions=args.ai_instructions or "",
+                )
+            else:
+                seeds = base_context
+                if not seeds:
+                    raise SystemExit("--type needs context from --add, --profile, --import-file, --harvest-file, --harvest-url, or --batch-file.")
+                if args.dry_run:
+                    print(f"Typed generation plan: {wordlist_type}, {len(seeds)} seed(s), limit {format_count(args.max_candidates)}.")
+                    if args.ai_generate:
+                        print(ai_wordlist_prompt(
+                            wordlist_type,
+                            seeds,
+                            args.max_candidates,
+                            instructions=args.ai_instructions or "",
+                        ))
+                    else:
+                        preview = generate_typed_wordlist(
+                            wordlist_type,
+                            seeds,
+                            limit=min(20, args.max_candidates),
+                            preserve_unicode=args.preserve_unicode,
+                        )
+                        print("\n".join(preview))
+                    return 0
+                if args.ai_generate:
+                    candidates = ai_generate_wordlist(
+                        ai_provider,
+                        wordlist_type,
+                        seeds,
+                        max_words=args.max_candidates,
+                        model=args.ai_model or "",
+                        instructions=args.ai_instructions or "",
+                        preserve_unicode=args.preserve_unicode,
+                    )
+                else:
+                    candidates = generate_typed_wordlist(
+                        wordlist_type,
+                        seeds,
+                        limit=args.max_candidates,
+                        preserve_unicode=args.preserve_unicode,
+                    )
+        except ValueError as exc:
+            raise SystemExit(f"Typed generation failed: {exc}") from exc
+        source = f"ai-generate:{wordlist_type}" if args.ai_generate else f"type:{wordlist_type}"
+        added = bank.add_many(candidates, source=source, preserve_unicode=args.preserve_unicode)
+        print(f"Added {format_count(added)} {wordlist_type} candidates.")
+        if args.output:
+            print(typed_wordlist_usage(wordlist_type, args.output))
     if args.mutate:
         bank.add_many(mutate_wordlist(bank.words(), options), source=f"mutate:{args.mutate}")
     if args.passphrase:
@@ -2234,6 +3125,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.harvest_file,
             args.harvest_url,
             args.profile,
+            args.wordlist_type,
+            args.ai_generate,
+            args.dry_run,
+            args.batch_file,
             args.mask,
             args.mutate,
             args.passphrase,

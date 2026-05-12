@@ -9,10 +9,14 @@ from wordit import (
     LinkExtractor,
     TextExtractor,
     WorditShell,
+    ai_wordlist_prompt,
     ai_provider_label,
     ai_keyword_prompt,
     build_profile_wordlist,
+    generate_batch_typed_wordlist,
+    generate_typed_wordlist,
     load_ai_config,
+    main,
     mask_secret,
     read_ai_config,
     estimate_mask_collection_keyspace,
@@ -27,10 +31,14 @@ from wordit import (
     mutate_wordlist,
     github_profile_name,
     normalize_harvest_target,
+    normalize_target_wordlist_type,
     option_preset,
     parse_ai_keywords,
+    parse_ai_wordlist_candidates,
     path_completions,
+    read_batch_seed_groups,
     url_hint_text,
+    validate_typed_candidate,
     write_ai_config,
 )
 
@@ -230,6 +238,78 @@ class WorditTests(unittest.TestCase):
         rules = generate_hashcat_rules(("2026",), ("!",))
         self.assertIn("$2$0$2$6", rules)
         self.assertIn("$2$0$2$6$!", rules)
+
+    def test_typed_generation_validates_tool_ready_outputs(self):
+        self.assertEqual(normalize_target_wordlist_type("cloud"), "cloud-resource")
+        subdomains = generate_typed_wordlist("subdomain", ["Acme Corp", "payments"], limit=80)
+        self.assertIn("acme-api", subdomains)
+        self.assertTrue(all(validate_typed_candidate("subdomain", item) for item in subdomains))
+        self.assertFalse(validate_typed_candidate("subdomain", "-api"))
+        self.assertFalse(validate_typed_candidate("subdomain", "api.test"))
+
+        directories = generate_typed_wordlist("directory", ["WordPress Acme PHP"], limit=80)
+        self.assertIn(".env", directories)
+        self.assertIn("api/v1", directories)
+        self.assertTrue(all(validate_typed_candidate("directory", item) for item in directories))
+        self.assertFalse(validate_typed_candidate("directory", "../../etc/passwd"))
+        self.assertFalse(validate_typed_candidate("directory", "/admin"))
+
+        cloud_names = generate_typed_wordlist("cloud-resource", ["Tesla Autopilot AWS"], limit=80)
+        self.assertIn("tesla-backup", cloud_names)
+        self.assertTrue(all(validate_typed_candidate("cloud-resource", item) for item in cloud_names))
+        self.assertFalse(validate_typed_candidate("cloud-resource", "-bucket"))
+
+        password_bases = generate_typed_wordlist("password-base", ["Acme Corp"], limit=30)
+        self.assertIn("acmecorp", password_bases)
+        self.assertTrue(all(validate_typed_candidate("password-base", item) for item in password_bases))
+        self.assertFalse(validate_typed_candidate("password-base", "pass-word"))
+
+    def test_ai_wordlist_prompt_parser_and_filtering(self):
+        prompt = ai_wordlist_prompt("directory", ["wordpress", "acme"], 5, instructions="Prefer php.")
+        self.assertIn("directory", prompt)
+        self.assertIn("Relative paths only", prompt)
+        self.assertIn("Prefer php.", prompt)
+
+        parsed = parse_ai_wordlist_candidates("1. admin\n- .env\nnotes: skip\n```text\napi/v1\n```")
+        self.assertEqual(parsed, ["admin", ".env", "api/v1"])
+
+    def test_typed_batch_generation_reads_seed_groups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "seeds.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("acme payments\n# comment\nbeta cloud\n")
+            groups = read_batch_seed_groups(path)
+
+        self.assertEqual(groups[0], ["acme", "payments", "acmepayments", "ap"])
+        words = generate_batch_typed_wordlist("subdomain", groups, batch_size=1, limit=30)
+        self.assertTrue(words)
+        self.assertLessEqual(len(words), 30)
+        self.assertTrue(all(validate_typed_candidate("subdomain", item) for item in words))
+
+    def test_cli_ai_dry_run_does_not_write_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "cloud.txt")
+            stream = StringIO()
+            with redirect_stdout(stream):
+                result = main(
+                    [
+                        "--type",
+                        "cloud",
+                        "--add",
+                        "Tesla Autopilot AWS",
+                        "--ai-generate",
+                        "--dry-run",
+                        "--max-candidates",
+                        "3",
+                        "-o",
+                        output_path,
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertFalse(os.path.exists(output_path))
+            text = stream.getvalue()
+            self.assertIn("cloud-resource", text)
+            self.assertIn("Target count: 3", text)
 
 
 if __name__ == "__main__":
