@@ -224,15 +224,6 @@ python3 -m py_compile wordit.py tests/test_wordit.py
 python3 -m unittest
 ```
 
-## Repository Notes
-
-Generated wordlists, masks, rule files, caches, local scratch files, and AI
-configuration files are ignored by `.gitignore`.
-
-Before publishing, review any local files that are not part of the project.
-This workspace currently contains ignored scratch/generated files that should not
-be committed.
-
 ## License
 
 MIT License. See [LICENSE](LICENSE).
