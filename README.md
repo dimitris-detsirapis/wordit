@@ -24,9 +24,9 @@ assess.
 - Per-type validation so generated candidates match their target tools.
 - URL and file harvesting with GitHub profile support.
 - Optional bounded recursive harvest with AI keyword enrichment.
-- Huge-pattern `.hcmask` export for shapes like `Tester` + 9 digits + 2 symbols.
 - Optional AI typed generation with dry-run prompt previews.
 - Batch seed-file processing for typed generation.
+- Huge-pattern `.hcmask` export for shapes like `Tester` + 9 digits + 2 symbols.
 - Hashcat-style mask generation, `.hcmask` templates, and small rule exports.
 - Scriptable command-line mode for repeatable workflows.
 
@@ -183,6 +183,15 @@ best-effort URL tokens such as names split from hyphenated profile paths.
 `Advanced options` -> `AI smart harvest` can crawl a small authorized scope and
 optionally ask OpenAI or Gemini to extract better seed words from the harvested
 text.
+
+When AI enrichment returns keywords, w0rd!t uses that filtered keyword set plus
+URL hints instead of dumping every raw page token into the session. If AI is off,
+unconfigured, or returns no usable keywords, it falls back to raw harvested words.
+
+AI providers receive the text w0rd!t harvested; they do not make blocked pages
+scrapeable. Sites such as LinkedIn may return anti-bot responses like HTTP 999,
+so use an exported profile, copied profile text, or another authorized public
+source when you need richer profile-specific seeds.
 
 Typed AI generation uses the same API setup:
 

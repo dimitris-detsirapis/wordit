@@ -1,8 +1,10 @@
+import gzip
 import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest.mock import patch
 
 from wordit import (
     BuildOptions,
@@ -13,6 +15,7 @@ from wordit import (
     ai_provider_label,
     ai_keyword_prompt,
     build_profile_wordlist,
+    decompress_http_payload,
     generate_batch_typed_wordlist,
     generate_typed_wordlist,
     load_ai_config,
@@ -137,6 +140,16 @@ class WorditTests(unittest.TestCase):
         self.assertIn("destirapis", text)
         self.assertIn("dimitrisdestirapis", text)
 
+    def test_url_hints_skip_common_web_and_profile_route_tokens(self):
+        text = url_hint_text("https://www.linkedin.com/in/dimitris-destirapis/")
+        words = text.split()
+        self.assertNotIn("www", words)
+        self.assertNotIn("linkedin", words)
+        self.assertNotIn("com", words)
+        self.assertNotIn("in", words)
+        self.assertIn("dimitris", words)
+        self.assertIn("destirapis", words)
+
     def test_url_target_normalization_and_github_profile_detection(self):
         self.assertEqual(normalize_harvest_target("github.com/octocat"), "https://github.com/octocat")
         self.assertEqual(github_profile_name("https://github.com/octocat"), "octocat")
@@ -162,23 +175,38 @@ class WorditTests(unittest.TestCase):
         parser = TextExtractor()
         parser.feed(
             '<html><head><meta name="description" content="Dimitris security profile"></head>'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<body><img alt="kista project"><script>ignore_me</script></body></html>'
         )
         text = parser.text()
         self.assertIn("Dimitris security profile", text)
         self.assertIn("kista project", text)
+        self.assertNotIn("device-width", text)
         self.assertNotIn("ignore_me", text)
 
     def test_link_extractor_normalizes_links(self):
         parser = LinkExtractor("https://example.com/base/page.html")
-        parser.feed('<a href="/profile">Profile</a><a href="#local">Local</a><a href="mailto:test@example.com">Mail</a>')
+        parser.feed(
+            '<a href="/profile">Profile</a><a href="#local">Local</a>'
+            '<a href="mailto:test@example.com">Mail</a><a href="/app.js">JS</a>'
+        )
         self.assertIn("https://example.com/profile", parser.links)
         self.assertIn("https://example.com/base/page.html", parser.links)
         self.assertFalse(any(link.startswith("mailto:") for link in parser.links))
+        self.assertFalse(any(link.endswith(".js") for link in parser.links))
+
+    def test_http_payload_decompresses_gzip(self):
+        payload = gzip.compress(b"<html><body>Python Security</body></html>")
+        self.assertEqual(
+            decompress_http_payload(payload, "gzip", 1_000),
+            b"<html><body>Python Security</body></html>",
+        )
 
     def test_ai_keyword_json_parser_and_prompt(self):
         words = parse_ai_keywords('{"keywords":["Kista","PAOK","Thessaloniki"]}')
         self.assertEqual(words, ["Kista", "PAOK", "Thessaloniki"])
+        fenced = parse_ai_keywords('```json\n{"keywords":["Kista","PAOK"]}\n```')
+        self.assertEqual(fenced, ["Kista", "PAOK"])
         prompt = ai_keyword_prompt("Kista PAOK", 5)
         self.assertIn('"keywords"', prompt)
         self.assertIn("Kista PAOK", prompt)
@@ -272,6 +300,47 @@ class WorditTests(unittest.TestCase):
 
         parsed = parse_ai_wordlist_candidates("1. admin\n- .env\nnotes: skip\n```text\napi/v1\n```")
         self.assertEqual(parsed, ["admin", ".env", "api/v1"])
+        json_parsed = parse_ai_wordlist_candidates('```json\n{"candidates":["admin",".env"]}\n```')
+        self.assertEqual(json_parsed, ["admin", ".env"])
+
+    def test_aiharvest_skips_provider_when_only_url_fallback_is_available(self):
+        shell = WorditShell()
+        target = "https://www.linkedin.com/in/dimitris-destirapis/"
+        hint_text = url_hint_text(target)
+        output = StringIO()
+        with (
+            patch.object(shell, "ask_bool", side_effect=[True, True, False]),
+            patch.object(shell, "ask_int", side_effect=[3, 1]),
+            patch.object(shell, "ask", side_effect=["gemini", ""]),
+            patch("wordit.crawl_url_text", return_value=(hint_text, [], [f"{target}: HTTP 999 <none>"])),
+            patch("wordit.ai_extract_keywords") as ai_extract,
+            redirect_stdout(output),
+        ):
+            shell.do_aiharvest(target)
+
+        ai_extract.assert_not_called()
+        text = output.getvalue()
+        self.assertIn("Only URL-derived fallback tokens were available", text)
+        self.assertIn("AI enrichment skipped", text)
+        self.assertEqual(shell.bank.words(), ["dimitris-destirapis", "dimitris", "destirapis", "dimitrisdestirapis"])
+
+    def test_aiharvest_uses_ai_filtered_keywords_when_available(self):
+        shell = WorditShell()
+        target = "https://example.com/profile"
+        harvested = "width device initial scale Dimitris Kista security project boilerplate"
+        output = StringIO()
+        with (
+            patch.object(shell, "ask_bool", side_effect=[True, True, False]),
+            patch.object(shell, "ask_int", side_effect=[3, 1]),
+            patch.object(shell, "ask", side_effect=["gemini", ""]),
+            patch("wordit.crawl_url_text", return_value=(harvested, [target], [])),
+            patch("wordit.ai_extract_keywords", return_value=["dimitris", "kista"]),
+            redirect_stdout(output),
+        ):
+            shell.do_aiharvest(target)
+
+        self.assertIn("Using AI-filtered keywords", output.getvalue())
+        self.assertEqual(shell.bank.words(), ["example", "dimitris", "kista"])
 
     def test_typed_batch_generation_reads_seed_groups(self):
         with tempfile.TemporaryDirectory() as temp_dir:

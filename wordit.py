@@ -18,6 +18,7 @@ import sys
 import textwrap
 import time
 import unicodedata
+import zlib
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -43,10 +44,95 @@ DEFAULT_MAX_LEN = 32
 DEFAULT_SYMBOLS = ("!", "@", "#", "$", "_")
 DEFAULT_SEPARATORS = ("", "_", "-", ".")
 DEFAULT_NUMBERS = tuple(str(item) for item in range(10)) + ("12", "23", "69", "123", "1234", "007")
+DEFAULT_CRAWL_USER_AGENT = f"{APP_NAME}/{VERSION} authorized-wordlist-builder"
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'_.-]{0,63}")
 UNICODE_WORD_RE = re.compile(r"\w[\w'_.-]{0,63}", re.UNICODE)
 DATE_SPLIT_RE = re.compile(r"[-_./\\\s]+")
 URLISH_RE = re.compile(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$")
+AI_CODE_FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)```", re.DOTALL)
+URL_HOST_STOPWORDS = {
+    "ai",
+    "app",
+    "co",
+    "com",
+    "dev",
+    "edu",
+    "gov",
+    "http",
+    "https",
+    "in",
+    "io",
+    "linkedin",
+    "net",
+    "org",
+    "www",
+}
+URL_PATH_STOPWORDS = {
+    "in",
+    "profile",
+    "profiles",
+    "user",
+    "users",
+}
+META_TEXT_KEYS = {
+    "application-name",
+    "article:author",
+    "article:section",
+    "author",
+    "description",
+    "keywords",
+    "name",
+    "og:description",
+    "og:site_name",
+    "og:title",
+    "profile:first_name",
+    "profile:last_name",
+    "profile:username",
+    "title",
+    "twitter:description",
+    "twitter:site",
+    "twitter:title",
+}
+CRAWL_SKIP_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".bmp",
+    ".css",
+    ".dmg",
+    ".doc",
+    ".docx",
+    ".eot",
+    ".exe",
+    ".gif",
+    ".gz",
+    ".ico",
+    ".iso",
+    ".jar",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".map",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".otf",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".rar",
+    ".svg",
+    ".tar",
+    ".tgz",
+    ".ttf",
+    ".webm",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".xls",
+    ".xlsx",
+    ".zip",
+}
 GITHUB_RESERVED_PATHS = {
     "about",
     "collections",
@@ -419,7 +505,8 @@ class TextExtractor(HTMLParser):
             return
         if tag_name == "meta":
             content = attr_map.get("content")
-            if content:
+            key = attr_map.get("name") or attr_map.get("property") or attr_map.get("itemprop") or ""
+            if content and key.lower() in META_TEXT_KEYS:
                 self.parts.append(content)
         for attr_name in ("title", "alt", "aria-label"):
             value = attr_map.get(attr_name)
@@ -455,6 +542,8 @@ class LinkExtractor(HTMLParser):
                 parsed = urlparse(url)
                 if parsed.scheme in {"http", "https"}:
                     normalized = parsed._replace(fragment="").geturl()
+                    if any(parsed.path.lower().endswith(ext) for ext in CRAWL_SKIP_EXTENSIONS):
+                        continue
                     self.links.append(normalized)
 
 
@@ -527,18 +616,28 @@ def normalize_harvest_target(target: str) -> str:
 def url_hint_text(url: str) -> str:
     parsed = urlparse(url)
     pieces: list[str] = []
-    host = parsed.netloc.split("@")[-1].split(":")[0]
-    if host:
-        pieces.extend(host.split("."))
-    for segment in parsed.path.split("/"):
-        segment = segment.strip()
-        if not segment:
-            continue
-        pieces.append(segment)
-        split_parts = [part for part in re.split(r"[-_.~]+", segment) if part]
+
+    def add_piece_variants(value: str, stopwords: set[str]) -> None:
+        value = value.strip()
+        if not value:
+            return
+        split_parts = [
+            part
+            for part in re.split(r"[-_.~]+", value)
+            if part and part.lower() not in stopwords
+        ]
+        if value.lower() not in stopwords:
+            pieces.append(value)
         pieces.extend(split_parts)
         if len(split_parts) > 1:
             pieces.append("".join(split_parts))
+
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    if host:
+        for label in host.split("."):
+            add_piece_variants(label, URL_HOST_STOPWORDS)
+    for segment in parsed.path.split("/"):
+        add_piece_variants(segment, URL_PATH_STOPWORDS)
     return " ".join(ordered_unique(pieces))
 
 
@@ -556,19 +655,78 @@ def github_profile_name(url: str) -> str | None:
     return username
 
 
+def crawl_request_headers() -> dict[str, str]:
+    user_agent = os.environ.get("W0RDIT_USER_AGENT", DEFAULT_CRAWL_USER_AGENT)
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.7,*/*;q=0.3",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": user_agent,
+    }
+
+
+def is_harvestable_content_type(content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if not media_type:
+        return True
+    if media_type.startswith("text/"):
+        return True
+    return media_type in {
+        "application/json",
+        "application/ld+json",
+        "application/rss+xml",
+        "application/xhtml+xml",
+        "application/xml",
+        "image/svg+xml",
+    }
+
+
+def decompress_http_payload(payload: bytes, content_encoding: str, max_bytes: int) -> bytes:
+    decoded = payload
+    encodings = [item.strip().lower() for item in content_encoding.split(",") if item.strip()]
+    for encoding in reversed(encodings):
+        if encoding in {"identity", "none"}:
+            continue
+        if encoding == "gzip":
+            decoded = decompress_limited(decoded, 16 + zlib.MAX_WBITS, max_bytes)
+            continue
+        if encoding == "deflate":
+            try:
+                decoded = decompress_limited(decoded, zlib.MAX_WBITS, max_bytes)
+            except zlib.error:
+                decoded = decompress_limited(decoded, -zlib.MAX_WBITS, max_bytes)
+            continue
+        raise ValueError(f"Unsupported content encoding: {encoding}.")
+    if len(decoded) > max_bytes:
+        raise ValueError(f"Decoded response was larger than {max_bytes:,} bytes.")
+    return decoded
+
+
+def decompress_limited(payload: bytes, wbits: int, max_bytes: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits)
+    decoded = decompressor.decompress(payload, max_bytes + 1)
+    if len(decoded) > max_bytes or decompressor.unconsumed_tail:
+        raise ValueError(f"Decoded response was larger than {max_bytes:,} bytes.")
+    decoded += decompressor.flush(max_bytes + 1 - len(decoded))
+    if len(decoded) > max_bytes:
+        raise ValueError(f"Decoded response was larger than {max_bytes:,} bytes.")
+    return decoded
+
+
 def fetch_url_text(url: str, max_bytes: int = 2_000_000, timeout: int = 10) -> tuple[str, str]:
     request = Request(
         url,
-        headers={
-            "Accept": "text/html,application/json,text/plain;q=0.9,*/*;q=0.8",
-            "User-Agent": f"{APP_NAME}/{VERSION} authorized-wordlist-builder",
-        },
+        headers=crawl_request_headers(),
     )
     with urlopen(request, timeout=timeout) as response:
         payload = response.read(max_bytes + 1)
         if len(payload) > max_bytes:
             raise ValueError(f"Response was larger than {max_bytes:,} bytes.")
         content_type = response.headers.get("content-type", "")
+        content_encoding = response.headers.get("content-encoding", "")
+    if not is_harvestable_content_type(content_type):
+        raise ValueError(f"Unsupported content type: {content_type}.")
+    payload = decompress_http_payload(payload, content_encoding, max_bytes)
     charset = "utf-8"
     match = re.search(r"charset=([A-Za-z0-9_.-]+)", content_type)
     if match:
@@ -719,17 +877,38 @@ def parse_ai_keywords(payload: str, preserve_unicode: bool = False) -> list[str]
     payload = payload.strip()
     if not payload:
         return []
-    try:
-        decoded = json.loads(payload)
-        if isinstance(decoded, dict):
-            values = decoded.get("keywords", [])
-        else:
-            values = decoded
-        if isinstance(values, list):
-            return ordered_unique(str(item) for item in values if str(item).strip())
-    except json.JSONDecodeError:
-        pass
+    for candidate in ai_json_payload_candidates(payload):
+        try:
+            decoded = json.loads(candidate)
+            if isinstance(decoded, dict):
+                values = decoded.get("keywords", [])
+            else:
+                values = decoded
+            if isinstance(values, list):
+                return ordered_unique(str(item) for item in values if str(item).strip())
+        except json.JSONDecodeError:
+            continue
     return extract_words(payload, min_len=2, max_len=32, lowercase=False, preserve_unicode=preserve_unicode)
+
+
+def ai_json_payload_candidates(payload: str) -> list[str]:
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip()
+        if value and value not in variants:
+            variants.append(value)
+
+    add(payload)
+    for match in AI_CODE_FENCE_RE.finditer(payload):
+        add(match.group(1))
+    for value in list(variants):
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = value.find(opener)
+            end = value.rfind(closer)
+            if start >= 0 and end > start:
+                add(value[start : end + 1])
+    return variants
 
 
 def extract_openai_response_text(data: dict[str, object]) -> str:
@@ -1220,24 +1399,25 @@ def parse_ai_wordlist_candidates(payload: str) -> list[str]:
     payload = payload.strip()
     if not payload:
         return []
-    try:
-        decoded = json.loads(payload)
-        values: object
-        if isinstance(decoded, dict):
-            values = (
-                decoded.get("candidates")
-                or decoded.get("words")
-                or decoded.get("wordlist")
-                or decoded.get("items")
-                or decoded.get("keywords")
-                or []
-            )
-        else:
-            values = decoded
-        if isinstance(values, list):
-            return [str(item).strip() for item in values if str(item).strip()]
-    except json.JSONDecodeError:
-        pass
+    for candidate in ai_json_payload_candidates(payload):
+        try:
+            decoded = json.loads(candidate)
+            values: object
+            if isinstance(decoded, dict):
+                values = (
+                    decoded.get("candidates")
+                    or decoded.get("words")
+                    or decoded.get("wordlist")
+                    or decoded.get("items")
+                    or decoded.get("keywords")
+                    or []
+                )
+            else:
+                values = decoded
+            if isinstance(values, list):
+                return [str(item).strip() for item in values if str(item).strip()]
+        except json.JSONDecodeError:
+            continue
 
     candidates: list[str] = []
     for line in payload.splitlines():
@@ -2387,6 +2567,15 @@ class WorditShell(cmd.Cmd):
             print("Fetch notes:")
             for error in errors[:5]:
                 print(f"  {error}")
+        url_fallback_only = not fetched and bool(errors)
+        if url_fallback_only:
+            print("Only URL-derived fallback tokens were available; no page content was harvested.")
+            host = urlparse(target).netloc.lower()
+            if host == "linkedin.com" or host.endswith(".linkedin.com"):
+                print(
+                    "LinkedIn often blocks direct non-browser fetches; export or copy the profile text "
+                    "and harvest that file for richer seeds."
+                )
         normal_words = extract_words(
             text,
             min_len=2,
@@ -2394,8 +2583,17 @@ class WorditShell(cmd.Cmd):
             lowercase=True,
             preserve_unicode=preserve_unicode,
         )
+        hint_words = extract_words(
+            " ".join(url_hint_text(url) for url in ordered_unique([target, *fetched])),
+            min_len=2,
+            max_len=32,
+            lowercase=True,
+            preserve_unicode=preserve_unicode,
+        )
         ai_words: list[str] = []
-        if provider != "off":
+        if provider != "off" and url_fallback_only:
+            print("AI enrichment skipped: no fetched page text was available to send to the provider.")
+        elif provider != "off":
             try:
                 ai_words = ai_extract_keywords(
                     provider,
@@ -2404,17 +2602,33 @@ class WorditShell(cmd.Cmd):
                     model=model,
                     preserve_unicode=preserve_unicode,
                 )
+                if ai_words:
+                    print(f"AI enrichment returned {format_count(len(ai_words))} keyword(s).")
+                else:
+                    print("AI enrichment returned no usable keywords.")
             except ValueError as exc:
                 print(f"AI enrichment skipped: {exc}")
                 if provider == "openai":
                     print("Run AI API setup from Advanced options to enable OpenAI enrichment.")
                 elif provider == "gemini":
                     print("Run AI API setup from Advanced options to enable Gemini enrichment.")
-        combined = ordered_unique([*normal_words, *ai_words])
+        if ai_words:
+            combined = ordered_unique([*hint_words, *ai_words])
+            print("Using AI-filtered keywords plus URL hints.")
+        else:
+            combined = normal_words
         if not combined:
             print("No words were found. Check that the URL is public and reachable.")
             return
-        added = self.bank.add_many(combined, source=f"aiharvest:{provider}", preserve_unicode=preserve_unicode)
+        if url_fallback_only:
+            source_provider = "url-fallback"
+        elif ai_words:
+            source_provider = provider
+        elif provider == "off":
+            source_provider = "off"
+        else:
+            source_provider = "raw-harvest"
+        added = self.bank.add_many(combined, source=f"aiharvest:{source_provider}", preserve_unicode=preserve_unicode)
         if added == 0:
             print("No new candidates added; the harvested words were already in this session.")
             return
